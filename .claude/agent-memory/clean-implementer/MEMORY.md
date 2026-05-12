@@ -172,6 +172,18 @@ Zod v4 (^4.3.6) strict by default. Mock response JSON must exactly match Zod sch
 - **CLI**: `--server <name>` flag for single-server debugging via `serverFilter` on `PipelineRunConfig`
 - **PipelineModels**: now includes `baseLlm: LanguageModelV3` field for per-server model creation
 
+## Web UI Testing
+- See `web-ui-testing.md` -- Svelte 5 stub-component pattern for `vi.mock`, App.svelte mocking, drawer query pattern.
+- Stub fixtures: `packages/web-ui/src/__test_stubs__/{RouteStub,Empty}.svelte`.
+
+## Memory Opt-In Helpers (per-persona memory)
+- **Pure helper**: `src/memory/memory-policy.ts` -- `isMemoryEnabledFor(inputs)` + `MemoryGateInputs`; type-only imports of PersonaDefinition/JobDefinition/ResolvedUserConfig (no runtime cycle)
+- **Loader-aware wrapper**: `src/persona/memory-gate.ts` -- `isMemoryEnabledForPersonaName(name, userConfig)`; fail-closed try/catch on loadPersona
+- **Schema fields**: `PersonaMemoryConfig` in `src/persona/types.ts`, `JobMemoryConfig` in `src/cron/types.ts`; both `{ enabled: boolean }`, optional on the parent
+- **Cycle gotcha**: putting the loader-aware variant in `src/memory/` would close `memory/ -> persona/ -> memory/` cycle (resolve.ts imports MEMORY_SERVER_NAME from memory-annotations.ts). Keep loader-aware on persona/ side
+- **Orchestrator wiring (Step 3 done)**: `WorkflowOrchestratorDeps.userConfig: ResolvedUserConfig` is required. `getRequiredServersForScope` adds `memory` when ANY persona in the scope opts in (any-persona-wants-it semantics). Test fixture `makeTestUserConfig()` in `test/workflow/test-helpers.ts` builds a minimal default-on ResolvedUserConfig; `createDeps` includes it.
+- **Design**: `docs/designs/per-persona-memory-optin.md` -- 13-step migration; Step 3 done = orchestrator deps + relay derivation
+
 ## Design Documents
 - `docs/designs/policy-compilation-pipeline.md` -- pipeline design spec
 - `docs/designs/multi-server-onboarding.md` -- TB1a design spec (role extensibility + git server)
