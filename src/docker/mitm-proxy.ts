@@ -24,6 +24,7 @@ import { randomSerialNumber, type CertificateAuthority } from './ca.js';
 import {
   isEndpointAllowed,
   shouldRewriteBody,
+  type AgentKind,
   type ProviderConfig,
   type RequestBodyRewriter,
 } from './provider-config.js';
@@ -159,6 +160,15 @@ export interface MitmProxyOptions {
    * call), extraction sites skip publishing entirely.
    */
   readonly sessionId?: import('../session/types.js').SessionId;
+
+  /**
+   * Kind of agent driving this proxy, used by request-body rewriters to
+   * apply agent-kind-conditional transforms (currently: stripping the
+   * schedule built-in skill's tools when set to `'workflow'`). Immutable
+   * over the proxy's lifetime — a single bundle serves a single agent kind.
+   * `undefined` means rewriters fall back to the most conservative behavior.
+   */
+  readonly agentKind?: AgentKind;
 }
 
 export interface ProviderKeyMapping {
@@ -500,6 +510,8 @@ export function createMitmProxy(options: MitmProxyOptions): MitmProxy {
   // fetched lazily at each push site so `resetTokenStreamBus()` between
   // tests is honored.
   let tokenSessionId: import('../session/types.js').SessionId | undefined = options.sessionId;
+
+  const agentKind: AgentKind | undefined = options.agentKind;
 
   // Parse CA cert and key from PEM
   const caCert = forge.pki.certificateFromPem(options.ca.certPem);
@@ -959,12 +971,10 @@ export function createMitmProxy(options: MitmProxyOptions): MitmProxy {
           const reqPath = path as string;
           try {
             const parsed = JSON.parse(rawBody.toString()) as Record<string, unknown>;
-            const result = rewriter(parsed, { method: reqMethod, path: reqPath });
+            const result = rewriter(parsed, { method: reqMethod, path: reqPath, agentKind });
             if (result) {
               finalBody = Buffer.from(JSON.stringify(result.modified));
-              logger.info(
-                `[mitm-proxy] POST ${targetHost}${path} - stripped server-side tools: ${result.stripped.join(', ')}`,
-              );
+              logger.info(`[mitm-proxy] POST ${targetHost}${path} - stripped tools: ${result.stripped.join(', ')}`);
             }
           } catch {
             logger.info(`[mitm-proxy] POST ${targetHost}${path} - failed to parse request body, forwarding as-is`);

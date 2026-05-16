@@ -7,6 +7,16 @@
  */
 
 /**
+ * Discriminator for the agent invoking the proxy. Set at proxy construction
+ * time via `MitmProxyOptions.agentKind`. Currently the only named kind is
+ * `'workflow'`, which opts the request-body rewriter into workflow-only
+ * strips (e.g. removing the schedule built-in skill's tools). `undefined`
+ * means standalone / interactive / unknown — no agent-kind-conditional
+ * rewrites apply.
+ */
+export type AgentKind = 'workflow';
+
+/**
  * Result from a RequestBodyRewriter when modifications were made.
  */
 export interface RewriteResult {
@@ -19,10 +29,15 @@ export interface RewriteResult {
 /**
  * A function that inspects and optionally modifies a parsed JSON request body.
  * Returns a RewriteResult if the body was modified, or null if no changes needed.
+ *
+ * `context.agentKind` is the kind of agent that originated the request, when
+ * known. Rewriters that condition on agent kind should treat `undefined` as
+ * "no agent-kind context available" and fall back to the most conservative
+ * (i.e. non-stripping) behavior.
  */
 export type RequestBodyRewriter = (
   body: Record<string, unknown>,
-  context: { method: string; path: string },
+  context: { method: string; path: string; agentKind?: AgentKind },
 ) => RewriteResult | null;
 
 /**
@@ -158,27 +173,12 @@ export function isEndpointAllowed(
 // --- Request body rewriters ---
 
 /**
- * Returns the server-side tool type string if the tool entry is a
- * server-side tool, or null if it is a custom/MCP-bridged tool.
- *
- * Server-side tools have a `type` field that is not "custom".
- * Custom tools either have no `type` field or `type: "custom"`.
+ * Walks the Anthropic Messages API `tools` array, asking `classify` to
+ * label each entry. Entries with a non-null label are removed and their
+ * labels collected into `stripped`; entries returning `null` are kept.
+ * Returns `null` when nothing matched, so the caller can skip serialization.
  */
-function getServerSideToolType(tool: unknown): string | null {
-  if (typeof tool !== 'object' || tool === null || !('type' in tool)) return null;
-  const { type } = tool as Record<string, unknown>;
-  if (typeof type === 'string' && type !== 'custom') return type;
-  return null;
-}
-
-/**
- * Strips server-side tools from the Anthropic Messages API `tools` array.
- *
- * Server-side tools (e.g. web_search_20250305, computer_20250124) have a
- * `type` field that is not "custom". Custom/MCP-bridged tools either have
- * no `type` field or `type: "custom"`.
- */
-export function stripServerSideTools(body: Record<string, unknown>): RewriteResult | null {
+function stripToolsBy(body: Record<string, unknown>, classify: (tool: unknown) => string | null): RewriteResult | null {
   const tools = body.tools;
   if (!Array.isArray(tools) || tools.length === 0) return null;
 
@@ -186,20 +186,89 @@ export function stripServerSideTools(body: Record<string, unknown>): RewriteResu
   const kept: unknown[] = [];
 
   for (const tool of tools) {
-    const serverType = getServerSideToolType(tool);
-    if (serverType) {
-      stripped.push(serverType);
+    const label = classify(tool);
+    if (label !== null) {
+      stripped.push(label);
     } else {
       kept.push(tool);
     }
   }
 
   if (stripped.length === 0) return null;
+  return { modified: { ...body, tools: kept }, stripped };
+}
 
-  return {
-    modified: { ...body, tools: kept },
-    stripped,
-  };
+/**
+ * Server-side tools (e.g. web_search_20250305, computer_20250124) have a
+ * `type` field that is not "custom". Custom/MCP-bridged tools either have
+ * no `type` field or `type: "custom"`.
+ */
+export function stripServerSideTools(body: Record<string, unknown>): RewriteResult | null {
+  return stripToolsBy(body, (tool) => {
+    if (typeof tool !== 'object' || tool === null || !('type' in tool)) return null;
+    const { type } = tool as Record<string, unknown>;
+    return typeof type === 'string' && type !== 'custom' ? type : null;
+  });
+}
+
+/**
+ * Claude Code's built-in `schedule` skill exposes `ScheduleWakeup`,
+ * `CronCreate`, `CronList`, and `CronDelete`. These tools end the current
+ * assistant turn expecting an external Claude Code runtime to re-fire the
+ * session at the scheduled time. IronCurtain invokes `claude` as a one-shot
+ * subprocess and does NOT honor those wakeups: a workflow agent that calls
+ * `ScheduleWakeup` will silently end its turn (often with an empty thinking
+ * block and no text), which produces no parseable `agent_status` block and
+ * trips the workflow harness's missing-status guard.
+ *
+ * Upstream tracking: https://github.com/anthropics/claude-code/issues/53746
+ * (open enhancement, no committed fix).
+ */
+const SCHEDULE_SKILL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'ScheduleWakeup',
+  'CronCreate',
+  'CronList',
+  'CronDelete',
+]);
+
+/**
+ * Strips the schedule built-in skill's tools from the Anthropic Messages API
+ * `tools` array. Filters by tool `name` (these tools arrive as custom-shaped
+ * entries declared by the Claude Code CLI client, not as server-side tools).
+ */
+export function stripScheduleSkillTools(body: Record<string, unknown>): RewriteResult | null {
+  return stripToolsBy(body, (tool) => {
+    if (typeof tool !== 'object' || tool === null || !('name' in tool)) return null;
+    const { name } = tool as Record<string, unknown>;
+    return typeof name === 'string' && SCHEDULE_SKILL_TOOL_NAMES.has(name) ? name : null;
+  });
+}
+
+/**
+ * Combined rewriter for Anthropic /v1/messages requests. Always strips
+ * server-side tools; additionally strips the schedule built-in skill's tools
+ * when the originating agent is a workflow agent. Agent kinds other than
+ * 'workflow' (including `undefined`) do not strip the schedule tools, so
+ * interactive and standalone sessions are unaffected.
+ */
+export function anthropicRequestRewriter(
+  body: Record<string, unknown>,
+  context: { method: string; path: string; agentKind?: AgentKind },
+): RewriteResult | null {
+  const serverSide = stripServerSideTools(body);
+  const afterServerSide = serverSide ? serverSide.modified : body;
+
+  if (context.agentKind === 'workflow') {
+    const scheduleStrip = stripScheduleSkillTools(afterServerSide);
+    if (scheduleStrip) {
+      return {
+        modified: scheduleStrip.modified,
+        stripped: [...(serverSide?.stripped ?? []), ...scheduleStrip.stripped],
+      };
+    }
+  }
+
+  return serverSide;
 }
 
 /**
@@ -242,7 +311,7 @@ export const anthropicProvider: ProviderConfig = {
   ],
   keyInjection: { type: 'header', headerName: 'x-api-key' },
   fakeKeyPrefix: 'sk-ant-api03-ironcurtain-',
-  requestRewriter: stripServerSideTools,
+  requestRewriter: anthropicRequestRewriter,
   rewriteEndpoints: ['/v1/messages'],
 };
 
@@ -275,7 +344,7 @@ export const anthropicOAuthProvider: ProviderConfig = {
   ],
   keyInjection: { type: 'bearer' },
   fakeKeyPrefix: 'sk-ant-oat01-ironcurtain-',
-  requestRewriter: stripServerSideTools,
+  requestRewriter: anthropicRequestRewriter,
   rewriteEndpoints: ['/v1/messages'],
 };
 

@@ -34,7 +34,7 @@ import type { MitmProxy } from './mitm-proxy.js';
 import type { CertificateAuthority } from './ca.js';
 import type { DockerManager } from './types.js';
 import type { ProviderKeyMapping } from './mitm-proxy.js';
-import { parseUpstreamBaseUrl, type ProviderConfig, type UpstreamTarget } from './provider-config.js';
+import { parseUpstreamBaseUrl, type AgentKind, type ProviderConfig, type UpstreamTarget } from './provider-config.js';
 import { getInternalNetworkName } from './platform.js';
 import { cleanupContainers } from './container-lifecycle.js';
 import { clampDockerResources } from './resource-limits.js';
@@ -404,6 +404,9 @@ export async function prepareDockerInfrastructure(
   // so the bundleId default is only an initial placeholder. Double-cast
   // bridges the BundleId → SessionId brand gap on MitmProxyOptions.
   const routingId = bundleId as unknown as SessionId;
+  // A workflow bundle serves only workflow agents for its entire lifetime,
+  // so agentKind is fixed at construction time.
+  const agentKind: AgentKind | undefined = workflowId !== undefined ? 'workflow' : undefined;
   const mitmProxy = useTcp
     ? createMitmProxy({
         listenPort: 0,
@@ -413,6 +416,7 @@ export async function prepareDockerInfrastructure(
         packageValidation,
         controlPort: 0,
         sessionId: routingId,
+        agentKind,
       })
     : createMitmProxy({
         socketPath: getBundleMitmProxySocketPath(bundleId),
@@ -422,6 +426,7 @@ export async function prepareDockerInfrastructure(
         packageValidation,
         controlSocketPath: getBundleMitmControlSocketPath(bundleId),
         sessionId: routingId,
+        agentKind,
       });
 
   const docker = createDockerManager();
