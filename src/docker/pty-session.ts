@@ -961,7 +961,7 @@ function checkPtySize(containerId: string): Promise<{ rows: number; cols: number
   return new Promise((resolve) => {
     execFile(
       'docker',
-      // `--user codespace` mirrors DockerManager.exec; see the resize
+      // `--user codespace` mirrors ContainerRuntime.exec; see the resize
       // callsite above for the issue #232 rationale.
       ['exec', '--user', 'codespace', containerId, '/etc/ironcurtain/check-pty-size.sh'],
       { timeout: 5000 },
@@ -1012,7 +1012,7 @@ async function verifyInitialPtySize(
     await new Promise<void>((resolve) => {
       execFile(
         'docker',
-        // `--user codespace` mirrors DockerManager.exec; see issue #232.
+        // `--user codespace` mirrors ContainerRuntime.exec; see issue #232.
         [
           'exec',
           '--user',

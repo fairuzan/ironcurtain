@@ -239,4 +239,5 @@ No single layer handles everything. A prompt-injected agent might try to exfiltr
 - [Package Installation Proxy](docs/designs/package-installation-proxy.md) -- Registry proxy for npm/PyPI/APT with age gate
 - [Google Workspace Integration](docs/designs/google-workspace-integration.md) -- OAuth credential management for Google MCP servers
 - [Execution Containment](docs/designs/execution-containment.md) -- OS-level sandboxing via bubblewrap/srt
+- [Apple `container` Runtime](docs/designs/apple-container-runtime.md) -- VM-per-container backend for macOS (proposed)
 - [Security Concerns](docs/SECURITY_CONCERNS.md) -- Known threats, attack vectors, and residual risks

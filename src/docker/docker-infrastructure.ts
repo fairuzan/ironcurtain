@@ -39,7 +39,7 @@ import type { DockerProxy } from './code-mode-proxy.js';
 import type { MitmProxy } from './mitm-proxy.js';
 import type { TrajectoryCaptureWriter } from './trajectory-capture.js';
 import type { CertificateAuthority } from './ca.js';
-import type { DockerManager } from './types.js';
+import type { ContainerRuntime } from './types.js';
 import type { ProviderKeyMapping } from './mitm-proxy.js';
 import { parseUpstreamBaseUrl, type AgentKind, type ProviderConfig, type UpstreamTarget } from './provider-config.js';
 import { getInternalNetworkName } from './platform.js';
@@ -157,7 +157,7 @@ export interface PreContainerInfrastructure {
   readonly auditLogPath: string;
   readonly proxy: DockerProxy;
   readonly mitmProxy: MitmProxy;
-  readonly docker: DockerManager;
+  readonly docker: ContainerRuntime;
   readonly adapter: AgentAdapter;
   readonly ca: CertificateAuthority;
   readonly fakeKeys: Map<string, string>;
@@ -352,7 +352,7 @@ export async function prepareDockerInfrastructure(
   const { createMitmProxy } = await import('./mitm-proxy.js');
   const { loadOrCreateCA } = await import('./ca.js');
   const { generateFakeKey } = await import('./fake-keys.js');
-  const { createDockerManager } = await import('./docker-manager.js');
+  const { createContainerRuntime } = await import('./container-runtime.js');
   const { useTcpTransport } = await import('./platform.js');
   const { getIronCurtainHome } = await import('../config/paths.js');
   const { prepareSession } = await import('./orientation.js');
@@ -538,7 +538,7 @@ export async function prepareDockerInfrastructure(
         ...captureProxyOptions,
       });
 
-  const docker = createDockerManager();
+  const docker = createContainerRuntime('docker');
 
   // Start MITM proxy FIRST so config.mitmControlAddr is set before proxy.start().
   // proxy.start() initializes the UTCP sandbox, which checks config.mitmControlAddr
@@ -890,7 +890,7 @@ export interface ContainerResources {
  *
  * Exported for testability: tests exercise the mount/env configuration and
  * the rollback-on-failure path by passing a mock `PreContainerInfrastructure`
- * with a scripted `DockerManager`.
+ * with a scripted `ContainerRuntime`.
  */
 export async function createSessionContainers(
   core: PreContainerInfrastructure,
@@ -1107,7 +1107,7 @@ export async function createSessionContainers(
  * sidecar on the internal Docker network. Throws a descriptive error if not.
  */
 async function checkInternalNetworkConnectivity(
-  docker: DockerManager,
+  docker: ContainerRuntime,
   containerId: string,
   mcpPort: number,
 ): Promise<void> {
@@ -1222,13 +1222,13 @@ export function prepareConversationStateDir(sessionDir: string, config: Conversa
 export async function ensureDockerImage(agentId: AgentId, userConfig: ResolvedUserConfig): Promise<void> {
   const { registerBuiltinAdapters, getAgent } = await import('./agent-registry.js');
   const { loadOrCreateCA } = await import('./ca.js');
-  const { createDockerManager } = await import('./docker-manager.js');
+  const { createContainerRuntime } = await import('./container-runtime.js');
   const { getIronCurtainHome } = await import('../config/paths.js');
 
   await registerBuiltinAdapters(userConfig);
   const adapter = getAgent(agentId);
   const image = await adapter.getImage();
-  const docker = createDockerManager();
+  const docker = createContainerRuntime('docker');
   const ca = loadOrCreateCA(resolve(getIronCurtainHome(), 'ca'));
   await ensureImage(image, docker, ca);
 }
@@ -1239,7 +1239,7 @@ export async function ensureDockerImage(agentId: AgentId, userConfig: ResolvedUs
  * agent-specific image. Content-hash labels on each image drive staleness
  * detection so repeated calls skip rebuilds when nothing has changed.
  */
-async function ensureImage(image: string, docker: DockerManager, ca: CertificateAuthority): Promise<void> {
+async function ensureImage(image: string, docker: ContainerRuntime, ca: CertificateAuthority): Promise<void> {
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
   const dockerDir = resolve(packageRoot, 'docker');
 
@@ -1276,7 +1276,7 @@ async function ensureImage(image: string, docker: DockerManager, ca: Certificate
 
 async function ensureBaseImage(
   baseImage: string,
-  docker: DockerManager,
+  docker: ContainerRuntime,
   ca: CertificateAuthority,
   dockerDir: string,
   dockerfile: string,
@@ -1303,7 +1303,7 @@ async function ensureBaseImage(
   return true;
 }
 
-async function isImageStale(image: string, docker: DockerManager, expectedHash: string): Promise<boolean> {
+async function isImageStale(image: string, docker: ContainerRuntime, expectedHash: string): Promise<boolean> {
   if (!(await docker.imageExists(image))) return true;
   const storedHash = await docker.getImageLabel(image, 'ironcurtain.build-hash');
   return storedHash !== expectedHash;

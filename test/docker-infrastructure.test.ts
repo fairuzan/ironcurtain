@@ -12,7 +12,7 @@ import {
 import type { AgentAdapter, ConversationStateConfig } from '../src/docker/agent-adapter.js';
 import type { DockerProxy } from '../src/docker/code-mode-proxy.js';
 import type { MitmProxy } from '../src/docker/mitm-proxy.js';
-import type { DockerManager } from '../src/docker/types.js';
+import type { ContainerRuntime } from '../src/docker/types.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
 import { getInternalNetworkName } from '../src/docker/platform.js';
 import { getBundleShortId, type BundleId } from '../src/session/types.js';
@@ -285,7 +285,7 @@ describe('prepareConversationStateDir', () => {
 //
 // These tests exercise the container-creation helper used by
 // createDockerInfrastructure(). They drive a scripted PreContainerInfrastructure
-// with a mock DockerManager to verify:
+// with a mock ContainerRuntime to verify:
 //   - the main container's mount configuration (security: only sockets subdir
 //     in UDS mode, never the full session dir with escalation/audit files)
 //   - rollback semantics when a downstream step (connectivity check) fails
@@ -297,10 +297,10 @@ type MockDockerOverrides = Pick<CreateMockDockerOptions, 'exec' | 'create'>;
 /**
  * Thin wrapper around the shared createMockDocker that bundles a
  * DockerCallTracker for test assertions. The shared helper returns just
- * the DockerManager; this wrapper flattens the tracker into the same
+ * the ContainerRuntime; this wrapper flattens the tracker into the same
  * return shape the tests already use.
  */
-function makeMockDocker(overrides: MockDockerOverrides = {}): { docker: DockerManager } & DockerCallTracker {
+function makeMockDocker(overrides: MockDockerOverrides = {}): { docker: ContainerRuntime } & DockerCallTracker {
   const tracker = createDockerCallTracker();
   const docker = createMockDocker({ tracker, ...overrides });
   return { docker, ...tracker };
@@ -355,7 +355,7 @@ function makeMockConfig(): IronCurtainConfig {
 interface MockCoreOptions {
   readonly tempDir: string;
   readonly useTcp: boolean;
-  readonly docker: DockerManager;
+  readonly docker: ContainerRuntime;
   readonly adapter?: AgentAdapter;
 }
 
@@ -573,7 +573,7 @@ describe('createSessionContainers', () => {
 // --- destroyDockerInfrastructure tests ---
 //
 // These tests exercise the teardown counterpart to createDockerInfrastructure().
-// They drive a scripted DockerInfrastructure bundle with a mock DockerManager
+// They drive a scripted DockerInfrastructure bundle with a mock ContainerRuntime
 // and mock proxies to verify:
 //   - all teardown steps run, in the right order
 //   - UDS mode skips sidecar + network steps (those fields are undefined in
@@ -631,7 +631,7 @@ function makeTrackedDockerProxy(opts: { throwOnStop?: boolean } = {}): DockerPro
 interface MakeBundleOptions {
   readonly tempDir: string;
   readonly useTcp: boolean;
-  readonly docker: DockerManager;
+  readonly docker: ContainerRuntime;
   readonly mitmProxy: MitmProxy;
   readonly proxy: DockerProxy;
 }
@@ -738,7 +738,7 @@ describe('destroyDockerInfrastructure', () => {
     // failures internally, so downstream proxy stops should still run.
     const stoppedContainers: string[] = [];
     const removedContainers: string[] = [];
-    const docker: DockerManager = {
+    const docker: ContainerRuntime = {
       ...makeMockDocker().docker,
       async stop(id: string) {
         stoppedContainers.push(id);

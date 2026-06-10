@@ -138,14 +138,19 @@ export interface DockerExecResult {
 }
 
 /**
- * Manages Docker container lifecycle for agent sessions.
+ * Manages container lifecycle for agent sessions.
  *
- * Uses the Docker CLI (not the Docker API) for simplicity.
- * The Docker socket is only accessed from the host process,
- * never from inside agent containers.
+ * Implementations wrap a specific container runtime CLI -- Docker today
+ * (`createDockerManager()` in docker-manager.ts), Apple `container` planned
+ * (see docs/designs/apple-container-runtime.md). Select via
+ * `createContainerRuntime()` in container-runtime.ts.
+ *
+ * Implementations use the runtime's CLI (not an engine API) for simplicity.
+ * The runtime is only invoked from the host process, never from inside
+ * agent containers.
  */
-export interface DockerManager {
-  /** Check that Docker is available and the image exists. */
+export interface ContainerRuntime {
+  /** Check that the runtime is available and the image exists. */
   preflight(image: string): Promise<void>;
 
   /** Create a container with the given configuration. Returns container ID. */
