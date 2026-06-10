@@ -71,7 +71,9 @@ Platform floor: Apple silicon, macOS 26 (the `container network` commands do not
 
 6. **Runtime selection: `containerRuntime: 'docker' | 'apple-container' | 'auto'` in `~/.ironcurtain/config.json`.** `auto` (default) prefers `apple-container` when its preflight passes (binary present, version >= 1.0, `container system status` healthy, Apple silicon, macOS 26+) and falls back to Docker otherwise. The signal-cli service container and daemon orphan sweeps stay on Docker until a later phase -- they are host services, not agent sandboxes, and gain nothing from a VM-per-container runtime.
 
-7. **Image pipeline reuse.** `Dockerfile.base.arm64` plus the CA-cert bake and build-hash labels are reused verbatim; only the build command changes (`container build`). Apple silicon is required, so the arm64 Dockerfile is the only path. Subnets come from a configurable pool with collision detection at network-create time (vmnet networks share the host's routing table with the LAN).
+7. **Docker-based MCP servers run under the Apple CLI.** Some MCP server configs spawn containers themselves (`docker run -i --rm -e VAR <image>`, e.g. the GitHub server). On machines without Docker, the MCP relay translates these spawns to the `container` CLI (`src/trusted-process/container-command.ts`) — the flags used are CLI-compatible, stdout stays pure MCP JSON-RPC (the Apple CLI's startup progress goes to stderr), and the VM exits with the relay via `--rm` + stdin EOF. The translation is narrow (only `docker run`, only when `docker` is absent and `container` is present); anything unconnectable is warn-skipped per server rather than killing the relay.
+
+8. **Image pipeline reuse.** `Dockerfile.base.arm64` plus the CA-cert bake and build-hash labels are reused verbatim; only the build command changes (`container build`). Apple silicon is required, so the arm64 Dockerfile is the only path. Subnets come from a configurable pool with collision detection at network-create time (vmnet networks share the host's routing table with the LAN).
 
 ## Implementation Plan
 
