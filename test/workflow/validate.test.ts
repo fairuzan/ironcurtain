@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import {
   validateDefinition,
   validateWorkflowSkillReferences,
@@ -733,6 +734,20 @@ describe('validateDefinition', () => {
       }
     });
 
+    it('rejects an agent containerScope in builtin mode (sharedContainer is ignored there)', () => {
+      const def = sharedContainerDef({ stateContainerScopes: { plan: 'env-a' } });
+      // sharedContainer stays true, isolating the mode check: builtin mode
+      // ignores sharedContainer, so the scope would be a silent no-op.
+      (def.settings as Record<string, unknown>) = { mode: 'builtin', sharedContainer: true };
+      expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
+      try {
+        validateDefinition(def);
+      } catch (err) {
+        if (!(err instanceof WorkflowValidationError)) throw err;
+        expect(err.issues.some((i) => /containerScope.*mode.*not "docker"/.test(i))).toBe(true);
+      }
+    });
+
     it('rejects containerScope values that violate the charset', () => {
       const def = sharedContainerDef({ stateContainerScopes: { plan: 'env a' } });
       expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
@@ -789,7 +804,101 @@ describe('validateDefinition', () => {
       };
       expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
     });
+
+    it('accepts containerized deterministic states in docker shared-container mode', () => {
+      const def = sharedContainerDef({});
+      const states = def.states as Record<string, unknown>;
+      states.review = {
+        type: 'deterministic',
+        description: 'Run container helper',
+        container: true,
+        containerScope: 'primary',
+        timeoutMs: 1000,
+        run: [['python', '/workflow-scripts/check.py']],
+        transitions: [{ to: 'done', guard: 'isPassed' }, { to: 'done' }],
+      };
+      expect(() => validateDefinition(def)).not.toThrow();
+    });
+
+    it('rejects deterministic containerScope without container true', () => {
+      const def = sharedContainerDef({});
+      const states = def.states as Record<string, unknown>;
+      states.review = {
+        type: 'deterministic',
+        description: 'Bad scope',
+        containerScope: 'primary',
+        run: [['true']],
+        transitions: [{ to: 'done' }],
+      };
+      expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
+      try {
+        validateDefinition(def);
+      } catch (err) {
+        if (!(err instanceof WorkflowValidationError)) throw err;
+        expect(err.issues.some((i) => i.includes('containerScope but is not container: true'))).toBe(true);
+      }
+    });
+
+    it('rejects deterministic container true without sharedContainer true', () => {
+      const def = sharedContainerDef({});
+      (def.settings as Record<string, unknown>) = { mode: 'docker', dockerAgent: 'claude-code' };
+      const states = def.states as Record<string, unknown>;
+      states.review = {
+        type: 'deterministic',
+        description: 'No shared container',
+        container: true,
+        run: [['true']],
+        transitions: [{ to: 'done' }],
+      };
+      expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
+      try {
+        validateDefinition(def);
+      } catch (err) {
+        if (!(err instanceof WorkflowValidationError)) throw err;
+        expect(err.issues.some((i) => i.includes('container: true'))).toBe(true);
+      }
+    });
+
+    it('rejects deterministic container true in builtin mode', () => {
+      const def = sharedContainerDef({});
+      (def.settings as Record<string, unknown>) = { mode: 'builtin', sharedContainer: true };
+      const states = def.states as Record<string, unknown>;
+      states.review = {
+        type: 'deterministic',
+        description: 'Builtin cannot exec in container',
+        container: true,
+        run: [['true']],
+        transitions: [{ to: 'done' }],
+      };
+      expect(() => validateDefinition(def)).toThrow(WorkflowValidationError);
+      try {
+        validateDefinition(def);
+      } catch (err) {
+        if (!(err instanceof WorkflowValidationError)) throw err;
+        expect(err.issues.some((i) => i.includes('settings.mode is not "docker"'))).toBe(true);
+      }
+    });
   });
+});
+
+// ---------------------------------------------------------------------------
+// No-regression — shipped workflows still validate after the schema additions
+// (deterministic `container` / `containerScope` / `timeoutMs`). None of these
+// ship a deterministic state, so this is a pure backward-compat gate on the
+// schema changes: every bundled workflow.yaml must still parse + validate with
+// zero errors. (Test plan §11 #1, backward-compat clause.)
+// ---------------------------------------------------------------------------
+
+describe('shipped workflows validate unchanged', () => {
+  const workflowsDir = resolve(__dirname, '..', '..', 'src', 'workflow', 'workflows');
+
+  for (const name of ['vuln-discovery', 'design-and-code', 'test-email-summary']) {
+    it(`${name}: workflow.yaml validates without errors`, () => {
+      const manifestPath = resolve(workflowsDir, name, 'workflow.yaml');
+      const raw = parseYaml(readFileSync(manifestPath, 'utf-8'), { maxAliasCount: 0 });
+      expect(() => validateDefinition(raw)).not.toThrow();
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
