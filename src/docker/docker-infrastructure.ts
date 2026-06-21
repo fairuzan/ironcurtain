@@ -1564,6 +1564,37 @@ export async function ensureDockerImage(agentId: AgentId, userConfig: ResolvedUs
  * agent-specific image. Content-hash labels on each image drive staleness
  * detection so repeated calls skip rebuilds when nothing has changed.
  */
+/**
+ * Builds `image` from a fresh temp directory populated with the contents of
+ * `dockerDir` (plus any `extraFiles`, keyed dest→src). Building from a clean
+ * dir outside any git repo is REQUIRED for Apple `container build`, which
+ * resolves an EMPTY context when handed a git-tracked source directory (the
+ * repo's docker/ in a checkout/worktree) — making `COPY` fail with "not
+ * found"; harmless on Docker. The Dockerfiles only COPY files that live in
+ * `dockerDir` / `extraFiles`.
+ */
+async function buildImageFromCleanContext(
+  docker: ContainerRuntime,
+  image: string,
+  dockerDir: string,
+  dockerfile: string,
+  labels: Record<string, string>,
+  extraFiles: Record<string, string> = {},
+): Promise<void> {
+  const tmpContext = mkdtempSync(resolve(tmpdir(), 'ironcurtain-build-'));
+  try {
+    for (const file of readdirSync(dockerDir)) {
+      copyFileSync(resolve(dockerDir, file), resolve(tmpContext, file));
+    }
+    for (const [dest, src] of Object.entries(extraFiles)) {
+      copyFileSync(src, resolve(tmpContext, dest));
+    }
+    await docker.buildImage(image, resolve(tmpContext, dockerfile), tmpContext, labels);
+  } finally {
+    rmSync(tmpContext, { recursive: true, force: true });
+  }
+}
+
 // `docker` is typed `ContainerRuntime` (the apple-container generalization of
 // the former `DockerManager`); exported because callers/tests import it.
 export async function ensureImage(image: string, docker: ContainerRuntime, ca: CertificateAuthority): Promise<string> {
@@ -1594,23 +1625,9 @@ export async function ensureImage(image: string, docker: ContainerRuntime, ca: C
 
   if (needsAgentBuild) {
     logger.info(`Building Docker image ${image}...`);
-    // Build from a clean temp context, mirroring ensureBaseImage. Apple
-    // `container build` resolves an EMPTY build context when handed a
-    // git-tracked source directory (e.g. the repo's docker/ in a checkout or
-    // worktree), which makes `COPY entrypoint-*.sh` fail with "not found". A
-    // fresh tmp dir outside any git repo transfers the full context on both
-    // runtimes; the agent Dockerfiles only COPY files that live in dockerDir.
-    const tmpContext = mkdtempSync(resolve(tmpdir(), 'ironcurtain-agent-build-'));
-    try {
-      for (const file of readdirSync(dockerDir)) {
-        copyFileSync(resolve(dockerDir, file), resolve(tmpContext, file));
-      }
-      await docker.buildImage(image, resolve(tmpContext, dockerfile), tmpContext, {
-        'ironcurtain.build-hash': agentBuildHash,
-      });
-    } finally {
-      rmSync(tmpContext, { recursive: true, force: true });
-    }
+    await buildImageFromCleanContext(docker, image, dockerDir, dockerfile, {
+      'ironcurtain.build-hash': agentBuildHash,
+    });
     logger.info(`Docker image ${image} built successfully`);
   }
 
@@ -1831,19 +1848,14 @@ async function ensureBaseImage(
 
   logger.info('Building base Docker image (this may take a while on first run)...');
 
-  const tmpContext = mkdtempSync(resolve(tmpdir(), 'ironcurtain-build-'));
-  try {
-    for (const file of readdirSync(dockerDir)) {
-      copyFileSync(resolve(dockerDir, file), resolve(tmpContext, file));
-    }
-    copyFileSync(ca.certPath, resolve(tmpContext, 'ironcurtain-ca-cert.pem'));
-
-    await docker.buildImage(baseImage, resolve(tmpContext, dockerfile), tmpContext, {
-      'ironcurtain.build-hash': buildHash,
-    });
-  } finally {
-    rmSync(tmpContext, { recursive: true, force: true });
-  }
+  await buildImageFromCleanContext(
+    docker,
+    baseImage,
+    dockerDir,
+    dockerfile,
+    { 'ironcurtain.build-hash': buildHash },
+    { 'ironcurtain-ca-cert.pem': ca.certPath },
+  );
   logger.info('Base Docker image built successfully');
   return true;
 }

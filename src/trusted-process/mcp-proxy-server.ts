@@ -628,6 +628,10 @@ async function main(): Promise<void> {
         `Skipping MCP server "${serverName}": failed to connect (${cmd}): ${err instanceof Error ? err.message : String(err)}${stderrSnippet}`,
         sessionLogPath,
       );
+      // `client.connect` may have spawned the backend subprocess (via
+      // StdioClientTransport) before failing; close it so a half-started
+      // backend doesn't leak a child process for the relay's lifetime.
+      await client.close().catch(() => {});
       // This server is being skipped; stop the OAuth refresher started for it
       // above so it does not keep running force-refresh loops for a backend
       // that never connected (shutdown-time cleanup would otherwise be the

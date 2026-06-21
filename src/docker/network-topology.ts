@@ -71,6 +71,15 @@ export function gatewayForSubnet(subnet: string): string {
   return `${octets[0]}.${octets[1]}.${octets[2]}.1`;
 }
 
+/** Derives the /24 subnet (CIDR) containing a gateway address. Inverse of gatewayForSubnet. */
+export function subnetForGateway(gateway: string): string {
+  const octets = gateway.split('.');
+  if (octets.length !== 4) {
+    throw new Error(`Cannot derive subnet from gateway: ${gateway}`);
+  }
+  return `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
+}
+
 /**
  * Creates a per-bundle host-only network, walking the subnet pool on
  * overlap conflicts (vmnet rejects overlapping subnets with an
@@ -100,11 +109,14 @@ export async function createHostOnlyNetwork(docker: ContainerRuntime, name: stri
     const subnet = HOST_ONLY_SUBNET_POOL[(offset + i) % HOST_ONLY_SUBNET_POOL.length];
     try {
       await docker.createNetwork(name, { internal: true, subnet });
-      // When the create reused a surviving stale network, its actual
-      // subnet may differ from the one we just tried — trust the
-      // runtime's view of the gateway over the derived value.
-      const gateway = (await docker.getNetworkGateway?.(name)) ?? gatewayForSubnet(subnet);
-      return { name, subnet, gateway };
+      // When the create reused a surviving stale network, its actual subnet
+      // may differ from the one we just tried. Trust the runtime's view of the
+      // gateway, and derive the returned subnet from it so the source guard
+      // (which keys on the subnet prefix) matches the real network.
+      const runtimeGateway = await docker.getNetworkGateway?.(name);
+      const gateway = runtimeGateway ?? gatewayForSubnet(subnet);
+      const actualSubnet = runtimeGateway ? subnetForGateway(runtimeGateway) : subnet;
+      return { name, subnet: actualSubnet, gateway };
     } catch (err) {
       if (isExecError(err) && err.stderr.includes('overlaps an existing network')) {
         lastError = err;

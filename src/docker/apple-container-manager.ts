@@ -27,7 +27,6 @@ import type { ContainerRuntime, DockerContainerConfig, DockerExecResult, DockerI
 import * as logger from '../logger.js';
 import type { DockerAvailability } from './docker-probe.js';
 import { isExecError, isExecTimeout } from '../utils/exec-error.js';
-import { spawnWithIdleTimeout } from './spawn-with-idle-timeout.js';
 import {
   defaultExecFile,
   type ExecFileFn,
@@ -37,9 +36,10 @@ import {
   IRONCURTAIN_LABEL_BUNDLE,
   IRONCURTAIN_LABEL_WORKFLOW,
   IRONCURTAIN_LABEL_SCOPE,
+  makeRunStreamed,
   type CreateDockerManagerOptions,
 } from './docker-manager.js';
-import { createDockerProgressSink, type DockerProgressSink } from './docker-progress-sink.js';
+import { createDockerProgressSink } from './docker-progress-sink.js';
 
 /** Grace period for `container stop` before the runtime kills the VM. */
 const STOP_TIMEOUT_SECONDS = 10;
@@ -81,6 +81,11 @@ function firstInspectEntry(stdout: string): unknown {
 /** Digests appear both bare and `sha256:`-prefixed; compare normalized. */
 function normalizeDigest(digest: string): string {
   return digest.startsWith('sha256:') ? digest.slice('sha256:'.length) : digest;
+}
+
+/** Rejects with a consistent "feature is Docker-only" error for unsupported runtime ops. */
+function unsupported(feature: string): Promise<never> {
+  return Promise.reject(new Error(`apple-container does not support ${feature}; use the Docker backend`));
 }
 
 /** Host facts consulted by the availability probe; injectable for tests. */
@@ -265,33 +270,7 @@ export function createAppleContainerManager(
     stderrSink: spawnOpts?.stderrSink,
   };
   const progressSinkFactory = spawnOpts?.progressSinkFactory ?? createDockerProgressSink;
-
-  // Mirrors runStreamed in docker-manager.ts: idle-timeout watchdog plus a
-  // progress sink collapsing pull/build chatter to a single status line.
-  const runStreamed = async (params: {
-    operation: 'container pull' | 'container build';
-    args: readonly string[];
-    idleTimeoutMs: number;
-  }): Promise<void> => {
-    const hasInjectedSinks = streamOpts.stdoutSink !== undefined && streamOpts.stderrSink !== undefined;
-    const progress: DockerProgressSink | undefined = hasInjectedSinks
-      ? undefined
-      : progressSinkFactory({ operation: params.operation });
-    try {
-      await spawnWithIdleTimeout('container', params.args, {
-        idleTimeoutMs: params.idleTimeoutMs,
-        operation: params.operation,
-        spawn: streamOpts.spawn,
-        stdoutSink: streamOpts.stdoutSink ?? progress?.stdout,
-        stderrSink: streamOpts.stderrSink ?? progress?.stderr,
-      });
-      progress?.finish(true);
-    } catch (err) {
-      progress?.finish(false);
-      progress?.dumpRecent();
-      throw err;
-    }
-  };
+  const runStreamed = makeRunStreamed('container', streamOpts, progressSinkFactory);
 
   const inspectContainer = async (nameOrId: string, timeout: number): Promise<AppleContainerInspect | undefined> => {
     const { stdout } = await exec('container', ['inspect', nameOrId], { timeout });
@@ -445,29 +424,10 @@ export function createAppleContainerManager(
     // inspectImage) is Docker-only. The orchestrator's snapshot paths call
     // createDockerManager() directly, so these are never reached on the
     // apple-container backend; reject loudly rather than degrade silently.
-    commit(): Promise<string> {
-      return Promise.reject(
-        new Error('apple-container does not support image commit; use the Docker backend for workflow snapshots'),
-      );
-    },
-
-    removeImage(): Promise<boolean> {
-      return Promise.reject(
-        new Error('apple-container does not support image removal via this API; use the Docker backend'),
-      );
-    },
-
-    listImages(): Promise<readonly DockerImageInfo[]> {
-      return Promise.reject(
-        new Error('apple-container does not support image listing via this API; use the Docker backend'),
-      );
-    },
-
-    inspectImage(): Promise<DockerImageInfo | undefined> {
-      return Promise.reject(
-        new Error('apple-container does not support image inspection via this API; use the Docker backend'),
-      );
-    },
+    commit: (): Promise<string> => unsupported('image commit (workflow snapshots)'),
+    removeImage: (): Promise<boolean> => unsupported('image removal'),
+    listImages: (): Promise<readonly DockerImageInfo[]> => unsupported('image listing'),
+    inspectImage: (): Promise<DockerImageInfo | undefined> => unsupported('image inspection'),
 
     async getContainerLabel(container: string, label: string): Promise<string | undefined> {
       try {
