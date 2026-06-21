@@ -1266,6 +1266,17 @@ export class WorkflowOrchestrator implements WorkflowController {
 
     const snapshots: Record<string, ContainerSnapshotRef> = {};
     for (const [scope, infra] of entries) {
+      // Container snapshots require Docker's commit/image APIs, which the Apple
+      // `container` runtime does not provide. Skip cleanly (the workflow stops
+      // without a resumable container snapshot) rather than attempting a commit
+      // that the runtime would reject.
+      if (infra.runtimeKind !== 'docker') {
+        writeStderr(
+          `[workflow] Container snapshots are not supported on the "${infra.runtimeKind}" runtime; ` +
+            `stopping ${instance.id} scope "${scope}" without a snapshot.`,
+        );
+        continue;
+      }
       try {
         snapshots[scope] = await commitContainerSnapshot({
           docker: infra.docker,

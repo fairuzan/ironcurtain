@@ -1594,9 +1594,23 @@ export async function ensureImage(image: string, docker: ContainerRuntime, ca: C
 
   if (needsAgentBuild) {
     logger.info(`Building Docker image ${image}...`);
-    await docker.buildImage(image, agentDockerfilePath, dockerDir, {
-      'ironcurtain.build-hash': agentBuildHash,
-    });
+    // Build from a clean temp context, mirroring ensureBaseImage. Apple
+    // `container build` resolves an EMPTY build context when handed a
+    // git-tracked source directory (e.g. the repo's docker/ in a checkout or
+    // worktree), which makes `COPY entrypoint-*.sh` fail with "not found". A
+    // fresh tmp dir outside any git repo transfers the full context on both
+    // runtimes; the agent Dockerfiles only COPY files that live in dockerDir.
+    const tmpContext = mkdtempSync(resolve(tmpdir(), 'ironcurtain-agent-build-'));
+    try {
+      for (const file of readdirSync(dockerDir)) {
+        copyFileSync(resolve(dockerDir, file), resolve(tmpContext, file));
+      }
+      await docker.buildImage(image, resolve(tmpContext, dockerfile), tmpContext, {
+        'ironcurtain.build-hash': agentBuildHash,
+      });
+    } finally {
+      rmSync(tmpContext, { recursive: true, force: true });
+    }
     logger.info(`Docker image ${image} built successfully`);
   }
 
