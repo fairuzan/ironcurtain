@@ -340,59 +340,10 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     });
 
     const scripts: Record<Scenario, string[]> = {
-      approve: [
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'complete',
-      ],
+      approve: ['design', 'design', 'design', 'complete'],
       'preflight-abort': [],
-      'evaluator-force-revision': [
-        'design',
-        'evaluate',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'complete',
-      ],
-      'final-force-revision': [
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'complete',
-        'design',
-        'evaluate',
-        'analyze',
-        'record',
-        'complete',
-      ],
+      'evaluator-force-revision': ['design', 'design', 'design', 'design', 'complete'],
+      'final-force-revision': ['design', 'design', 'design', 'complete', 'design', 'complete'],
     };
 
     let provisionTurns = 0;
@@ -524,9 +475,11 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     expect(escalationGate.stateName).toBe('human_escalation');
     expect(escalationGate.acceptedEvents).toEqual(['APPROVE', 'FORCE_REVISION', 'ABORT']);
     expect(escalationGate.presentedArtifacts.has('run_spec')).toBe(true);
-    // The orchestrator surfaces the deterministic verdict in the gate summary so a
-    // reviewer sees why the round was escalated (buildGateRequest, the orchestrator.ts change).
-    expect(escalationGate.summary).toContain('evaluator_blocked');
+    // The parent workers state now aggregates lane-level block reasons under an
+    // `escalate` verdict, so the gate carries the lane reason instead of opening
+    // a per-lane gate.
+    expect(escalationGate.summary).toContain('verdict: escalate');
+    expect(escalationGate.summary).toContain('lane 0 blocked');
     run.orchestrator.resolveGate(run.workflowId, {
       type: 'FORCE_REVISION',
       prompt: 'fix the candidate to define solve(xs)',

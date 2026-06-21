@@ -6,13 +6,15 @@ settings:
   mode: docker
   dockerAgent: claude-code
   sharedContainer: true
+  workers: 1
   model: anthropic:claude-sonnet-4-6
   # Safety backstop for a wedged round pipeline, NOT the round budget.
   # isRoundLimitReached trips when the MAX visit count across all states reaches
   # this number. On the happy path every state is entered once per evolution
   # round, so this bounds a clean run at ~maxRounds rounds; mid-round recovery
-  # (evaluator_blocked -> human_escalation -> resume) re-visits evaluate and the
-  # orchestrator, so a run with many recoveries trips the backstop in fewer
+  # (evaluator_blocked -> human_escalation in the child segment, then APPROVE
+  # back to orchestrator) may revisit evaluate/orchestrator, so a run with many
+  # recoveries trips the backstop in fewer
   # rounds. It is set well above run_spec.budget.max_rounds either way, so a
   # legitimate run is never capped before the orchestrator emits `complete`; the
   # real round budget is enforced by the orchestrator against
@@ -212,11 +214,13 @@ states:
          EVAL_TIMEOUT_SECS to 300 when nothing implies a different budget.
 
          If /workspace/initial_program exists, add 1 to MAX_ROUNDS before passing
-         it. The seed is copied verbatim as node 0 and the engine counts every
-         recorded node toward done_rounds, so without the +1 a request for N
-         rounds would yield only N-1 evolution rounds (the seed consumes one). The
-         +1 restores the requested number of evolution rounds. Do NOT add the +1
-         when no initial_program is seeded (node 0 is then a real first round).
+         it. The seed is copied verbatim as node 0, and done_rounds counts each
+         GENERATION toward the budget - at the workers:1 default every recorded node
+         is its own generation, so the seed consumes one generation. Without the +1
+         a request for N rounds would yield only N-1 evolution rounds (the seed
+         consumes one). The +1 restores the requested number of evolution rounds. Do
+         NOT add the +1 when no initial_program is seeded (node 0 is then a real
+         first round).
 
          /opt/workflow-venv/bin/python /workflow-scripts/evolve-brief normalize \
            --workspace-root /workspace \
@@ -315,17 +319,30 @@ states:
 
       Read these files first:
         - /workspace/.evolve_runs/main/run_spec.yaml - budget.max_rounds is N.
-        - /workspace/.evolve_runs/main/database_data/nodes.json - count its "nodes" map.
-          The file is absent before round 1, which means done_rounds = 0.
         - /workspace/.evolve_runs/main/current/stop_signals.json, if present. It
-          is written by analysis_record after the durable node record. Use its
-          precomputed stop_reason; do NOT recompute target, patience, or max-round
-          logic yourself.
+          is written by analysis_record after the durable node record and is the
+          single source of truth for round accounting. Read its precomputed fields
+          directly; do NOT count nodes.json or recompute anything yourself:
+            * done_rounds = the number of GENERATIONS recorded so far. One fan-out
+              batch of N lanes counts as ONE generation; at the workers:1 default
+              each round is one node and one generation, so done_rounds equals the
+              node tally there. The file is absent before round 1 (done_rounds = 0).
+            * node_count = the raw recorded-node tally (= done_rounds at workers:1,
+              and larger at workers>1 where a generation has multiple lane nodes).
+            * stop_reason = the precomputed stop decision. Use this verbatim; do NOT
+              recompute target, patience, or max-round logic yourself.
 
-      One recovery case: if a human just approved an evaluator-blocked round, you are
-      entered mid-round with a candidate written but not yet scored. Detect this by
-      /workspace/.evolve_runs/main/current/context.json present AND result.json absent,
-      and emit evaluate to resume that round rather than starting a new one.
+      Recovery after a human just approved an escalated round depends on the SCRATCH
+      SHAPE, which the previous output states explicitly:
+        - Bare current/ (the message says "Scratch is the bare current/"): a single
+          candidate is written but not yet scored. Confirm with
+          /workspace/.evolve_runs/main/current/context.json present AND result.json
+          absent, and emit evaluate to RESUME that round in place. Do NOT discard it
+          or start a fresh batch.
+        - Lane-scoped under current/lane_<k>/ (the message says "Scratch is
+          lane-scoped"): a fan-out batch escalated or drained its lanes. Discard that
+          lane scratch and re-decide normally; emit design for a fresh batch unless
+          stop_signals.json requires complete or the run is unrecoverable.
 
       If a human directive in this message requests more rounds, that directive
       overrides any stop_reason for THIS turn only: emit design to start one more
@@ -350,7 +367,7 @@ states:
     transitions:
       - to: failed
         guard: isRoundLimitReached
-      - to: sample
+      - to: workers
         when: { verdict: design }
       - to: evaluate
         when: { verdict: evaluate }
@@ -359,9 +376,25 @@ states:
       - to: human_escalation
         when: { verdict: escalate }
 
+  workers:
+    type: deterministic
+    description: Run one synchronous evolve round as a child FSM segment.
+    run: []
+    fanOut: { count: workers, join: barrier }
+    segment: [sample, researcher, evaluate, analyzer, analysis_record]
+    transitions:
+      - to: orchestrator
+        when: { verdict: recorded }
+      - to: human_escalation
+        when: { verdict: escalate }
+      - to: failed
+        when: { verdict: result_file_error }
+      - to: failed
+
   sample:
     type: deterministic
     description: Sample parent nodes and retrieve cognition; seed cognition on first entry.
+    fanOutMember: true
     container: true
     resultFile: .evolve_runs/main/current/sample.json
     run:
@@ -390,11 +423,12 @@ states:
   researcher:
     type: agent
     description: Evolve one candidate from sampled parents and retrieved cognition.
+    fanOutMember: true
     persona: global
     prompt: |
       Write exactly one candidate program for this round.
 
-      Read the round context at /workspace/.evolve_runs/main/current/context.json. It
+      Read the round context at {laneDir}/context.json. It
       contains:
         - step_name: the directory you must write the candidate into
         - parents: a list of sampled parent nodes, empty on round 1
@@ -424,6 +458,7 @@ states:
   evaluate:
     type: deterministic
     description: Run the configured evaluator on this round's candidate.
+    fanOutMember: true
     container: true
     resultFile: .evolve_runs/main/current/result.json
     run:
@@ -450,16 +485,17 @@ states:
   analyzer:
     type: agent
     description: Write a transferable lesson for the round.
+    fanOutMember: true
     persona: global
     prompt: |
       Analyze the round that just completed and write a SHORT transferable lesson.
 
-      Read /workspace/.evolve_runs/main/current/context.json, the just-evaluated
-      result at /workspace/.evolve_runs/main/current/result.json, and this round's
+      Read {laneDir}/context.json, the just-evaluated
+      result at {laneDir}/result.json, and this round's
       candidate at the step path named in context.json.
 
       Write a concise markdown lesson to:
-        /workspace/.evolve_runs/main/current/analysis.md
+        {laneDir}/analysis.md
       Keep it to a few sentences. Do not restate the score; capture the transferable insight.
       This lesson is promoted into the cognition store after the durable record,
       so write something future rounds can retrieve and apply.
@@ -474,6 +510,7 @@ states:
   analysis_record:
     type: deterministic
     description: The single durable engine node-write; commit the round with its lesson and parents.
+    fanOutMember: true
     container: true
     resultFile: .evolve_runs/main/current/analysis_record.json
     run:
@@ -537,9 +574,14 @@ states:
         - /workspace/.evolve_runs/main/run_spec.yaml - the objective, evaluator, and
           budget.max_rounds (= N).
         - /workspace/.evolve_runs/main/database_data/nodes.json - every recorded node
-          (id, parent, score, analysis). Count its "nodes" map for done_rounds.
+          (id, parent, score, analysis). Use it for the per-node trajectory, NOT for
+          round counts.
         - /workspace/.evolve_runs/main/current/stop_signals.json - the precomputed
-          stop_reason and stop metrics. Use this file; do NOT recompute the stop
+          stop_reason and stop metrics, and the authoritative round accounting:
+          done_rounds (GENERATIONS recorded - one fan-out batch of N lanes is ONE
+          generation; equals the node tally at the workers:1 default) and node_count
+          (the raw recorded-node tally). Read done_rounds from here; do NOT count
+          nodes.json. Use this file's stop_reason; do NOT recompute the stop
           condition.
         - /workspace/.evolve_runs/main/best/ - the best snapshot per improving round;
           the highest-scoring node is the run's result.
@@ -550,7 +592,8 @@ states:
       Create the /workspace/.workflow/final_report/ directory if it does not exist.
       The report MUST contain, in this order:
         1. The objective (one line, from run_spec.yaml).
-        2. done_rounds vs budget.max_rounds.
+        2. done_rounds vs budget.max_rounds (done_rounds from stop_signals.json,
+           counting generations - one fan-out batch is one generation).
         3. The stop reason from stop_signals.json: target_met, patience, max_rounds,
            or the recorded null/unknown value if no stop signal is present.
         4. The best node: its id, its score, and its analysis/lesson.

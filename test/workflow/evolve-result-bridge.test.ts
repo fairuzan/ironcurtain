@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
-import { validateDefinition } from '../../src/workflow/validate.js';
+import { isSafeWorkspaceRelativePath, validateDefinition } from '../../src/workflow/validate.js';
 import { lintWorkflow } from '../../src/workflow/lint.js';
+import { isWithinDirectory } from '../../src/types/argument-roles.js';
+import { evolveNode, writeEvolveLaneNodes, writeNodesFile } from './test-helpers.js';
 
 const PYTHON = process.env.PYTHON ?? 'python3';
 const WORKFLOW_DIR = resolve(__dirname, '..', '..', 'src', 'workflow', 'workflows', 'evolve');
@@ -46,7 +48,7 @@ describe('evolve workflow manifest', () => {
         };
         evaluate: { transitions: Array<{ to: string; when?: { verdict?: string } }> };
         researcher: { prompt: string; transitions: Array<{ to: string }> };
-        analyzer: { transitions: Array<{ to: string }> };
+        analyzer: { prompt: string; transitions: Array<{ to: string }> };
         analysis_record: { transitions: Array<{ to: string; when?: { verdict?: string } }> };
         preflight_review: {
           type: string;
@@ -92,11 +94,16 @@ describe('evolve workflow manifest', () => {
     // Linear round chain: sample -> researcher -> evaluate -> analyzer ->
     // analysis_record -> orchestrator. Only the durable record returns to the hub.
     expect(raw.states.researcher.transitions).toEqual([{ to: 'evaluate' }]);
+    expect(raw.states.researcher.prompt).toContain('{laneDir}/context.json');
+    expect(raw.states.researcher.prompt).not.toContain('/workspace/.evolve_runs/main/current/context.json');
     expect(raw.states.evaluate.transitions.find((t) => t.when?.verdict === 'evaluated')?.to).toBe('analyzer');
     expect(raw.states.evaluate.transitions.find((t) => t.when?.verdict === 'evaluator_blocked')?.to).toBe(
       'human_escalation',
     );
     expect(raw.states.analyzer.transitions).toEqual([{ to: 'analysis_record' }]);
+    expect(raw.states.analyzer.prompt).toContain('{laneDir}/result.json');
+    expect(raw.states.analyzer.prompt).toContain('{laneDir}/analysis.md');
+    expect(raw.states.analyzer.prompt).not.toContain('/workspace/.evolve_runs/main/current/result.json');
     expect(raw.states.analysis_record.transitions.find((t) => t.when?.verdict === 'recorded')?.to).toBe('orchestrator');
     expect(raw.states.preflight_review).toMatchObject({
       type: 'human_gate',
@@ -159,9 +166,16 @@ describe('evolve workflow manifest', () => {
     expect(prompt).not.toContain('not a hard gate');
     expect(prompt).not.toContain('the run stops on max_rounds');
     expect(raw.states.orchestrator.prompt).toContain('stop_signals.json');
-    expect(raw.states.orchestrator.prompt).toContain('precomputed stop_reason');
+    // The orchestrator must read the precomputed stop decision, not recompute it,
+    // and must read round accounting (done_rounds = generations) from the signal
+    // file rather than counting nodes.json.
+    expect(raw.states.orchestrator.prompt).toContain('precomputed stop decision');
+    expect(raw.states.orchestrator.prompt).toContain('do NOT count nodes.json');
+    expect(raw.states.orchestrator.prompt).toContain('done_rounds = the number of GENERATIONS');
     expect(raw.states.final_summary.prompt).toContain('stop_signals.json');
     expect(raw.states.final_summary.prompt).toContain('The stop reason from stop_signals.json');
+    // final_summary likewise sources done_rounds from the signal file, not a node count.
+    expect(raw.states.final_summary.prompt).toContain('do NOT count');
     expect(prompt).toContain('SAMPLE_N');
     expect(prompt).toContain('SAMPLER');
     expect(prompt).toContain('sampling_seed.txt');
@@ -225,6 +239,7 @@ describe('evolve_result.py bridge', () => {
   function runBridge(
     scriptsDir: string,
     args: readonly string[],
+    opts: { env?: Record<string, string | undefined> } = {},
   ): { status: number | null; result: Record<string, unknown> } {
     const resultFile = resolve(tmpDir, 'result.json');
     const completed = spawnSync(
@@ -232,6 +247,7 @@ describe('evolve_result.py bridge', () => {
       [resolve(scriptsDir, 'evolve_result.py'), ...args, '--result-file', resultFile],
       {
         encoding: 'utf-8',
+        env: { ...process.env, ...opts.env },
       },
     );
     if (completed.error) throw completed.error;
@@ -241,6 +257,43 @@ describe('evolve_result.py bridge', () => {
       status: completed.status,
       result: JSON.parse(readFileSync(resultFile, 'utf-8')) as Record<string, unknown>,
     };
+  }
+
+  // Async sibling of `runBridge`. It exists (rather than reusing the sync
+  // helper) because the concurrent-lane cases need genuinely parallel child
+  // processes — `spawnSync` would serialize them, defeating the test — and
+  // because those cases also assert on captured stderr, which the streaming
+  // `spawn` form makes available per-child. Single-process cases keep using
+  // the simpler synchronous `runBridge`.
+  function runBridgeAsync(
+    scriptsDir: string,
+    args: readonly string[],
+    resultFile: string,
+    env: Record<string, string | undefined> = {},
+  ): Promise<{ status: number | null; result: Record<string, unknown>; stderr: string }> {
+    return new Promise((resolveRun, reject) => {
+      const child = spawn(PYTHON, [resolve(scriptsDir, 'evolve_result.py'), ...args, '--result-file', resultFile], {
+        env: { ...process.env, ...env },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf-8');
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on('error', reject);
+      child.on('close', (status) => {
+        try {
+          resolveRun({
+            status,
+            stderr,
+            result: JSON.parse(readFileSync(resultFile, 'utf-8')) as Record<string, unknown>,
+          });
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    });
   }
 
   function evalArgs(runDir = resolve(tmpDir, 'run')): string[] {
@@ -274,26 +327,24 @@ describe('evolve_result.py bridge', () => {
   }
 
   function writeNodes(runDir: string, scores: readonly number[], stepOffset = 1): void {
-    mkdirSync(resolve(runDir, 'database_data'), { recursive: true });
     const nodes = Object.fromEntries(
-      scores.map((score, index) => {
-        const id = index;
-        const stepName = `step_${String(index + stepOffset).padStart(4, '0')}`;
-        return [
-          String(id),
-          {
-            id,
-            name: `round-${index + stepOffset}`,
-            parent: index === 0 ? [] : [index - 1],
-            score,
-            results: { eval_score: score },
-            analysis: `analysis ${id}`,
-            meta_info: { step_name: stepName },
-          },
-        ];
-      }),
+      scores.map((score, index) => [
+        String(index),
+        evolveNode({
+          id: index,
+          name: `round-${index + stepOffset}`,
+          parent: index === 0 ? [] : [index - 1],
+          score,
+          analysis: `analysis ${index}`,
+          batchIndex: index + stepOffset,
+        }),
+      ]),
     );
-    writeFileSync(resolve(runDir, 'database_data', 'nodes.json'), JSON.stringify({ next_id: scores.length, nodes }));
+    writeNodesFile(resolve(runDir, 'database_data'), nodes, false);
+  }
+
+  function writeLaneNodes(runDir: string, lanes: readonly number[], batchIndex = 1): void {
+    writeEvolveLaneNodes(resolve(runDir, 'database_data'), lanes, batchIndex);
   }
 
   function attachForExistingStep(scriptsDir: string, runDir: string, stepName: string): Record<string, unknown> {
@@ -316,6 +367,29 @@ describe('evolve_result.py bridge', () => {
       string,
       unknown
     >;
+  }
+
+  function attachForExistingStepLane(
+    scriptsDir: string,
+    runDir: string,
+    stepName: string,
+    lane: number,
+  ): Record<string, unknown> {
+    const laneDir = resolve(runDir, 'current', `lane_${lane}`);
+    mkdirSync(laneDir, { recursive: true });
+    const analysisFile = resolve(laneDir, 'analysis.md');
+    writeFileSync(analysisFile, 'lane analysis\n');
+    return runBridge(scriptsDir, [
+      'attach_analysis',
+      '--run-dir',
+      runDir,
+      '--lane',
+      String(lane),
+      '--step-name',
+      stepName,
+      '--analysis-file',
+      analysisFile,
+    ]).result;
   }
 
   function realScriptsDir(): string {
@@ -429,6 +503,56 @@ describe('evolve_result.py bridge', () => {
       .filter(Boolean)
       .map((line) => JSON.parse(line) as { event: string; payload: Record<string, unknown> });
   }
+
+  it.skipIf(!REAL_ENGINE_READY)('records two lane-tagged steps concurrently as distinct nodes', async () => {
+    const runDir = realRunDir('real-concurrent-lane-record');
+    writeRealRunSpec(runDir);
+    const scriptsDir = realScriptsDir();
+    const stepNames = ['step_0001_lane_0', 'step_0001_lane_1'];
+
+    for (const [lane, stepName] of stepNames.entries()) {
+      const stepDir = resolve(runDir, 'steps', stepName);
+      mkdirSync(stepDir, { recursive: true });
+      writeFileSync(resolve(stepDir, 'code'), `def score():\n    return ${lane + 1}\n`);
+      writeFileSync(resolve(stepDir, 'results.json'), JSON.stringify({ eval_score: lane + 1 }) + '\n');
+    }
+
+    const results = await Promise.all(
+      stepNames.map((stepName, lane) =>
+        runBridgeAsync(
+          scriptsDir,
+          [
+            'record',
+            '--run-dir',
+            runDir,
+            '--lane',
+            String(lane),
+            '--step-name',
+            stepName,
+            '--name',
+            `round-1-lane-${lane}`,
+            '--code-path',
+            `.evolve_runs/main/steps/${stepName}/code`,
+            '--results-file',
+            `.evolve_runs/main/steps/${stepName}/results.json`,
+          ],
+          resolve(tmpDir, `record-lane-${lane}.json`),
+          { EVOLVE_DB_TEST_HOLD_LOCK_MS: '50' },
+        ),
+      ),
+    );
+
+    expect(results.map((result) => result.status)).toEqual([0, 0]);
+    expect(results.map((result) => result.stderr)).toEqual(['', '']);
+    expect(results.map((result) => result.result.verdict)).toEqual(['recorded', 'recorded']);
+    const payload = JSON.parse(readFileSync(resolve(runDir, 'database_data', 'nodes.json'), 'utf-8')) as {
+      nodes: Record<string, { id: number; meta_info?: { step_name?: string } }>;
+    };
+    const nodes = Object.values(payload.nodes);
+    expect(nodes).toHaveLength(2);
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(2);
+    expect(new Set(nodes.map((node) => node.meta_info?.step_name))).toEqual(new Set(stepNames));
+  });
 
   it('maps a numeric eval_score to verdict evaluated', () => {
     const scriptsDir = writeHarness({});
@@ -714,21 +838,23 @@ describe('evolve_result.py bridge', () => {
     const runDir = resolve(tmpDir, 'dedup-run');
     writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 3, patience: 2 });
     mkdirSync(resolve(runDir, 'current'), { recursive: true });
-    mkdirSync(resolve(runDir, 'steps', 'step_0001'), { recursive: true });
+    mkdirSync(resolve(runDir, 'steps', 'step_0001_lane_0'), { recursive: true });
     const analysisFile = resolve(runDir, 'current', 'analysis.md');
-    const resultsFile = resolve(runDir, 'steps', 'step_0001', 'results.json');
+    const resultsFile = resolve(runDir, 'steps', 'step_0001_lane_0', 'results.json');
     writeFileSync(analysisFile, 'lesson\n');
-    writeFileSync(resolve(runDir, 'steps', 'step_0001', 'code'), 'def score():\n    return 1\n');
+    writeFileSync(resolve(runDir, 'steps', 'step_0001_lane_0', 'code'), 'def score():\n    return 1\n');
     writeFileSync(resultsFile, JSON.stringify({ eval_score: 7 }) + '\n');
 
     const args = [
       'attach_analysis',
       '--run-dir',
       runDir,
+      '--lane',
+      '0',
       '--step-name',
-      'step_0001',
+      'step_0001_lane_0',
       '--name',
-      'round-1',
+      'round-1-lane-0',
       '--parent',
       '0',
       '--code-path',
@@ -750,7 +876,7 @@ describe('evolve_result.py bridge', () => {
       payload: { node_id: 0, idempotent_skip: true },
     });
     expect(Object.keys(nodes.nodes)).toEqual(['0']);
-    expect(readFileSync(resolve(runDir, 'record-calls.txt'), 'utf-8').trim().split('\n')).toEqual(['step_0001']);
+    expect(readFileSync(resolve(runDir, 'record-calls.txt'), 'utf-8').trim().split('\n')).toEqual(['step_0001_lane_0']);
   });
 
   it.skipIf(!REAL_ENGINE_READY)(
@@ -808,6 +934,139 @@ describe('evolve_result.py bridge', () => {
       );
     },
   );
+
+  it.skipIf(!REAL_ENGINE_READY)(
+    'promotes recorded lane lessons serially at the barrier and deduplicates repeats',
+    () => {
+      const runDir = realRunDir('real-barrier-promote');
+      writeRealRunSpec(runDir);
+      const scriptsDir = realScriptsDir();
+      const lessons = ['lane zero distinct lesson', 'lane one distinct lesson', 'lane two distinct lesson'];
+      const stepNames = ['step_0001_lane_0', 'step_0001_lane_1', 'step_0001_lane_2'];
+
+      for (const [lane, stepName] of stepNames.entries()) {
+        const stepDir = resolve(runDir, 'steps', stepName);
+        mkdirSync(stepDir, { recursive: true });
+        mkdirSync(resolve(runDir, 'current', `lane_${lane}`), { recursive: true });
+        writeFileSync(resolve(stepDir, 'code'), `def score():\n    return ${lane + 1}\n`);
+        writeFileSync(resolve(stepDir, 'results.json'), JSON.stringify({ eval_score: lane + 1 }) + '\n');
+        writeFileSync(resolve(runDir, 'current', `lane_${lane}`, 'step_name'), stepName + '\n');
+        writeFileSync(resolve(runDir, 'current', `lane_${lane}`, 'analysis.md'), lessons[lane] + '\n');
+
+        const recorded = runBridge(scriptsDir, [
+          'attach_analysis',
+          '--run-dir',
+          runDir,
+          '--lane',
+          String(lane),
+          '--step-name',
+          stepName,
+          '--name',
+          `round-1-lane-${lane}`,
+          '--code-path',
+          `.evolve_runs/main/steps/${stepName}/code`,
+          '--results-file',
+          `.evolve_runs/main/steps/${stepName}/results.json`,
+          '--analysis-file',
+          resolve(runDir, 'current', `lane_${lane}`, 'analysis.md'),
+        ]);
+        expect(recorded.result).toMatchObject({ verdict: 'recorded', passed: true });
+        expect(recorded.result.payload).not.toHaveProperty('cognition_promoted');
+      }
+
+      expect(existsSync(resolve(runDir, 'cognition_promoted.json'))).toBe(false);
+
+      const promoted = runBridge(scriptsDir, [
+        'promote_cognition',
+        '--run-dir',
+        runDir,
+        '--lane',
+        '0',
+        '--lane',
+        '1',
+        '--lane',
+        '2',
+      ]);
+      expect(promoted.result).toMatchObject({
+        verdict: 'cognition_promoted',
+        passed: true,
+        payload: { promoted_count: 3, duplicate_count: 0 },
+      });
+      expect(
+        (promoted.result.payload as { promotions: Array<{ promoted: boolean; step_name: string }> }).promotions.map(
+          (item) => [item.step_name, item.promoted],
+        ),
+      ).toEqual([
+        ['step_0001_lane_0', true],
+        ['step_0001_lane_1', true],
+        ['step_0001_lane_2', true],
+      ]);
+
+      const contents = readCognitionItems(runDir).map((item) => item.content);
+      expect(contents).toEqual(expect.arrayContaining(lessons));
+      expect(Object.keys(readPromotionLedger(runDir))).toHaveLength(3);
+      expect(existsSync(resolve(runDir, 'cognition_data', '.promote.lock'))).toBe(false);
+
+      const replay = runBridge(scriptsDir, [
+        'promote_cognition',
+        '--run-dir',
+        runDir,
+        '--lane',
+        '0',
+        '--lane',
+        '1',
+        '--lane',
+        '2',
+      ]);
+      expect(replay.result).toMatchObject({
+        verdict: 'cognition_promoted',
+        passed: true,
+        payload: { promoted_count: 0, duplicate_count: 3 },
+      });
+      const afterReplay = readCognitionItems(runDir).filter((item) => item.metadata.kind === 'round_lesson');
+      expect(afterReplay).toHaveLength(3);
+      expect(Object.keys(readPromotionLedger(runDir))).toHaveLength(3);
+    },
+  );
+
+  it('promote_cognition reports needs_repair when a recorded lane cannot be reconciled', () => {
+    // The failure path the all-success cases never exercise: a barrier promote
+    // over a recorded lane whose durable node is gone (recorded_node_missing) and
+    // a lane with no resolvable step name (missing_step_name). Both populate the
+    // fatal `errors` list, so the whole promote yields needs_repair / passed:false
+    // — no real engine needed, the bridge bails before touching the cognition store.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'promote-failure-run');
+    // Lane 0 recorded step_0001_lane_0, but nodes.json holds only an unrelated step.
+    writeNodes(runDir, [3], 1);
+    mkdirSync(resolve(runDir, 'current', 'lane_0'), { recursive: true });
+    writeFileSync(
+      resolve(runDir, 'current', 'lane_0', 'analysis_record.json'),
+      JSON.stringify({ verdict: 'recorded', payload: { step_name: 'step_0001_lane_0', node_id: 0 } }) + '\n',
+    );
+    writeFileSync(resolve(runDir, 'current', 'lane_0', 'analysis.md'), 'lane zero lesson\n');
+    // Lane 1 has neither an analysis_record.json payload nor a step_name file.
+    mkdirSync(resolve(runDir, 'current', 'lane_1'), { recursive: true });
+
+    const { result } = runBridge(scriptsDir, ['promote_cognition', '--run-dir', runDir, '--lane', '0', '--lane', '1']);
+
+    expect(result).toMatchObject({
+      verdict: 'needs_repair',
+      passed: false,
+      payload: { lanes: [0, 1], promoted_count: 0 },
+    });
+    const errors = (result.payload as { errors: string[] }).errors;
+    expect(errors).toHaveLength(2);
+    expect(errors.some((message) => message.includes('recorded_node_missing'))).toBe(true);
+    expect(errors.some((message) => message.includes('missing_step_name'))).toBe(true);
+    const promotions = (result.payload as { promotions: Array<{ lane: number; reason: string }> }).promotions;
+    expect(promotions.map((item) => [item.lane, item.reason])).toEqual([
+      [0, 'recorded_node_missing'],
+      [1, 'missing_step_name'],
+    ]);
+    // The store was never written: the bridge fails closed before promotion.
+    expect(existsSync(resolve(runDir, 'cognition_promoted.json'))).toBe(false);
+  });
 
   it.skipIf(!REAL_ENGINE_READY)('deduplicates repeated lesson promotion against the real cognition store', () => {
     const runDir = realRunDir('real-cognition-dedup');
@@ -1064,6 +1323,466 @@ describe('evolve_result.py bridge', () => {
     expect(existsSync(resolve(runDir, 'current', 'stop_signals.json'))).toBe(false);
   });
 
+  it('uses EVOLVE_LANE to route sample scratch files under current/lane_<k> without clearing shared stop signals', () => {
+    const runDir = resolve(tmpDir, 'lane-sample-run');
+    writeRunSpec(runDir);
+    writeNodes(runDir, [3]);
+    const scriptsDir = writeHarness({
+      dbStub: "import json\nprint(json.dumps({'nodes': [{'id': 0, 'score': 3, 'analysis': 'prior'}]}))\n",
+    });
+    const laneDir = resolve(runDir, 'current', 'lane_2');
+    mkdirSync(laneDir, { recursive: true });
+    writeFileSync(resolve(laneDir, 'result.json'), '{"verdict":"old"}\n');
+    writeFileSync(resolve(laneDir, 'analysis.md'), 'old analysis\n');
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), '{"stop_reason":"target_met"}\n');
+
+    const { result } = runBridge(
+      scriptsDir,
+      ['sample', '--run-dir', runDir, '--query-from-spec', '--context-file', resolve(laneDir, 'context.json')],
+      { env: { EVOLVE_LANE: '2' } },
+    );
+
+    expect(result).toMatchObject({
+      verdict: 'sampled',
+      passed: true,
+      payload: { step_name: 'step_0002_lane_2', lane: 2 },
+    });
+    const context = JSON.parse(readFileSync(resolve(laneDir, 'context.json'), 'utf-8')) as { step_name: string };
+    expect(context.step_name).toBe('step_0002_lane_2');
+    expect(readFileSync(resolve(laneDir, 'step_name'), 'utf-8')).toBe('step_0002_lane_2\n');
+    expect(existsSync(resolve(laneDir, 'result.json'))).toBe(false);
+    expect(existsSync(resolve(laneDir, 'analysis.md'))).toBe(false);
+    expect(existsSync(resolve(runDir, 'current', 'stop_signals.json'))).toBe(true);
+    expect(existsSync(resolve(runDir, 'current', 'context.json'))).toBe(false);
+  });
+
+  it('sample_batch partitions distinct parents into per-lane current directories', () => {
+    const runDir = resolve(tmpDir, 'batch-sample-run');
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(
+      resolve(runDir, 'run_spec.yaml'),
+      JSON.stringify({
+        objective: 'solve batch target',
+        budget: { max_rounds: 3, patience: 2 },
+        sampling: { algorithm: 'island' },
+      }) + '\n',
+    );
+    writeFileSync(resolve(runDir, 'sampling_seed.txt'), '123\n');
+    writeNodes(runDir, [1, 2, 3]);
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), '{"stop_reason":"target_met"}\n');
+    const scriptsDir = writeHarness({
+      dbStub:
+        [
+          'import json, sys',
+          'from pathlib import Path',
+          "run_dir = Path(sys.argv[sys.argv.index('--run-dir') + 1])",
+          "(run_dir / 'calls.txt').write_text(' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')",
+          "print(json.dumps({'nodes': [",
+          "  {'id': 0, 'score': 1, 'analysis': 'a'},",
+          "  {'id': 1, 'score': 2, 'analysis': 'b'},",
+          "  {'id': 2, 'score': 3, 'analysis': 'c'},",
+          ']}))',
+        ].join('\n') + '\n',
+    });
+
+    const { result } = runBridge(scriptsDir, [
+      'sample_batch',
+      '--run-dir',
+      runDir,
+      '--workers',
+      '3',
+      '--query-from-spec',
+    ]);
+
+    expect(result).toMatchObject({
+      verdict: 'sample_batch_prepared',
+      passed: true,
+      payload: {
+        workers: 3,
+        batch_index: 4,
+        parent_ids: [0, 1, 2],
+      },
+    });
+    expect(readFileSync(resolve(runDir, 'calls.txt'), 'utf-8')).toContain('--n 3');
+    expect(existsSync(resolve(runDir, 'current', 'stop_signals.json'))).toBe(false);
+    expect(existsSync(resolve(runDir, 'current', 'context.json'))).toBe(false);
+    const assignedParentIds: number[] = [];
+    for (const lane of [0, 1, 2]) {
+      const laneDir = resolve(runDir, 'current', `lane_${lane}`);
+      const context = JSON.parse(readFileSync(resolve(laneDir, 'context.json'), 'utf-8')) as {
+        step_name: string;
+        parents: Array<{ id: number }>;
+      };
+      const sample = JSON.parse(readFileSync(resolve(laneDir, 'sample.json'), 'utf-8')) as {
+        payload: { lane_seed: number; parent_ids: number[] };
+      };
+      expect(context.step_name).toBe(`step_0004_lane_${lane}`);
+      expect(context.parents).toHaveLength(1);
+      assignedParentIds.push(context.parents[0].id);
+      expect(sample.payload.parent_ids).toEqual([context.parents[0].id]);
+      expect(sample.payload.lane_seed).toBe(123 + lane);
+    }
+    expect(assignedParentIds.sort()).toEqual([0, 1, 2]);
+  });
+
+  it('sample_batch can prepare only missing lanes for a partially recorded batch', () => {
+    const runDir = resolve(tmpDir, 'batch-sample-resume-run');
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(
+      resolve(runDir, 'run_spec.yaml'),
+      JSON.stringify({
+        objective: 'resume batch target',
+        budget: { max_rounds: 3, patience: 2 },
+        sampling: { algorithm: 'island' },
+      }) + '\n',
+    );
+    writeFileSync(resolve(runDir, 'sampling_seed.txt'), '50\n');
+    writeLaneNodes(runDir, [0], 1);
+    const recordedLaneDir = resolve(runDir, 'current', 'lane_0');
+    mkdirSync(recordedLaneDir, { recursive: true });
+    writeFileSync(resolve(recordedLaneDir, 'analysis.md'), 'keep recorded analysis\n');
+    const scriptsDir = writeHarness({
+      dbStub:
+        [
+          'import json, sys',
+          'from pathlib import Path',
+          "run_dir = Path(sys.argv[sys.argv.index('--run-dir') + 1])",
+          "(run_dir / 'calls.txt').write_text(' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')",
+          "print(json.dumps({'nodes': [",
+          "  {'id': 10, 'score': 1, 'analysis': 'a'},",
+          "  {'id': 11, 'score': 2, 'analysis': 'b'},",
+          ']}))',
+        ].join('\n') + '\n',
+    });
+
+    const { result } = runBridge(scriptsDir, [
+      'sample_batch',
+      '--run-dir',
+      runDir,
+      '--workers',
+      '3',
+      '--lane',
+      '1',
+      '--lane',
+      '2',
+      '--batch-index',
+      '1',
+      '--query-from-spec',
+    ]);
+
+    expect(result).toMatchObject({
+      verdict: 'sample_batch_prepared',
+      passed: true,
+      payload: {
+        workers: 3,
+        active_lanes: [1, 2],
+        active_lane_count: 2,
+        batch_index: 1,
+      },
+    });
+    const lanes = (result.payload as { lanes: Array<{ lane: number }> }).lanes;
+    expect(lanes.map((lane) => lane.lane)).toEqual([1, 2]);
+    expect(readFileSync(resolve(runDir, 'calls.txt'), 'utf-8')).toContain('--n 2');
+    expect(readFileSync(resolve(recordedLaneDir, 'analysis.md'), 'utf-8')).toBe('keep recorded analysis\n');
+    expect(existsSync(resolve(recordedLaneDir, 'context.json'))).toBe(false);
+    for (const lane of [1, 2]) {
+      const laneDir = resolve(runDir, 'current', `lane_${lane}`);
+      const context = JSON.parse(readFileSync(resolve(laneDir, 'context.json'), 'utf-8')) as {
+        step_name: string;
+      };
+      const sample = JSON.parse(readFileSync(resolve(laneDir, 'sample.json'), 'utf-8')) as {
+        payload: { lane_seed: number };
+      };
+      expect(context.step_name).toBe(`step_0001_lane_${lane}`);
+      expect(sample.payload.lane_seed).toBe(50 + lane);
+    }
+  });
+
+  it('sample_batch rejects duplicate parent partitions when enough parents exist', () => {
+    const runDir = resolve(tmpDir, 'batch-duplicate-parent-run');
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(
+      resolve(runDir, 'run_spec.yaml'),
+      JSON.stringify({
+        objective: 'solve duplicate target',
+        budget: { max_rounds: 3, patience: 2 },
+        sampling: { algorithm: 'island' },
+      }) + '\n',
+    );
+    writeFileSync(resolve(runDir, 'sampling_seed.txt'), '5\n');
+    writeNodes(runDir, [1, 2, 3]);
+    const scriptsDir = writeHarness({
+      dbStub:
+        [
+          'import json',
+          "print(json.dumps({'nodes': [",
+          "  {'id': 0, 'score': 1, 'analysis': 'a'},",
+          "  {'id': 0, 'score': 1, 'analysis': 'a again'},",
+          "  {'id': 2, 'score': 3, 'analysis': 'c'},",
+          ']}))',
+        ].join('\n') + '\n',
+    });
+
+    const { result } = runBridge(scriptsDir, [
+      'sample_batch',
+      '--run-dir',
+      runDir,
+      '--workers',
+      '3',
+      '--query-from-spec',
+    ]);
+
+    expect(result).toMatchObject({
+      verdict: 'sample_error',
+      passed: false,
+      payload: {
+        stage: 'db_sample',
+        parent_ids: [0, 0, 2],
+      },
+    });
+  });
+
+  it('lane attach_analysis writes only its lane-scoped stop_signals, not the barrier-owned canonical file', () => {
+    // SHOULD-FIX-1: under fan-out the canonical current/stop_signals.json is the
+    // single routing input the orchestrator reads once per batch. A per-lane
+    // attach_analysis must NOT touch it — it writes only current/lane_<k>/
+    // stop_signals.json — or N lanes race the routing input. This test fails
+    // WITHOUT the fix: the old code wrote the bare current/stop_signals.json on
+    // every lane, clobbering the pre-seeded canonical contents below.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'lane-stop-signals-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 5 });
+    writeNodes(runDir, [1, 2], 1);
+    // The step the lane re-records (idempotent skip) is one of the existing nodes.
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    const sentinel = '{"stop_reason":"barrier_owned_sentinel"}\n';
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), sentinel);
+
+    const result = attachForExistingStepLane(scriptsDir, runDir, 'step_0001', 0);
+
+    expect(result).toMatchObject({ verdict: 'recorded', payload: { idempotent_skip: true } });
+    // The lane wrote its OWN copy under current/lane_0/...
+    const laneSignals = JSON.parse(
+      readFileSync(resolve(runDir, 'current', 'lane_0', 'stop_signals.json'), 'utf-8'),
+    ) as Record<string, unknown>;
+    expect(laneSignals.stop_reason).toBeNull();
+    expect((result.payload as { stop_signals_path: string }).stop_signals_path).toContain('lane_0');
+    // ...and left the barrier-owned canonical file untouched.
+    expect(readFileSync(resolve(runDir, 'current', 'stop_signals.json'), 'utf-8')).toBe(sentinel);
+  });
+
+  it('compute_stop_signals writes the single canonical stop_signals once over the batch-grown nodes', () => {
+    // The barrier computes the canonical file exactly once at the join. It must
+    // reflect the FULL node set (the batch grew nodes.json by N), regardless of
+    // any stale per-lane copies, and write the bare current/stop_signals.json.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'compute-stop-signals-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 3, patience: 5 });
+    writeNodes(runDir, [1, 2, 3], 1);
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    // Stale canonical + a leftover per-lane copy that must be ignored.
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), '{"stop_reason":"stale"}\n');
+    mkdirSync(resolve(runDir, 'current', 'lane_0'), { recursive: true });
+    writeFileSync(resolve(runDir, 'current', 'lane_0', 'stop_signals.json'), '{"stop_reason":"lane_local"}\n');
+
+    const { result } = runBridge(scriptsDir, ['compute_stop_signals', '--run-dir', runDir]);
+
+    expect(result).toMatchObject({
+      verdict: 'stop_signals_computed',
+      passed: true,
+      payload: { stop_reason: 'max_rounds', done_rounds: 3 },
+    });
+    const signals = readStopSignals(runDir);
+    expect(signals).toMatchObject({ done_rounds: 3, max_rounds: 3, stop_reason: 'max_rounds' });
+    // The barrier write is over ALL nodes, not the stale value.
+    expect(signals.stop_reason).not.toBe('stale');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Generation-denominated stop conditions (Finding B). At workers:N one batch
+  // of N lanes is ONE generation, so patience/max_rounds must count batches, not
+  // nodes. At workers:1 every node is its own generation, so the counters stay
+  // byte-identical to the old node-denominated output.
+  // ---------------------------------------------------------------------------
+
+  // Writes a nodes.json from explicit (score, batchIndex, lane?) triples. A null
+  // lane is a legacy workers:1 `step_<batchIndex>` node (its own generation); an
+  // integer lane is a fan-out `step_<batchIndex>_lane_<k>` node (lanes of one
+  // batch share a generation). Node ids increase in listed order.
+  function writeGenerationNodes(
+    runDir: string,
+    triples: ReadonlyArray<readonly [score: number, batchIndex: number, lane?: number]>,
+  ): void {
+    const nodes = Object.fromEntries(
+      triples.map(([score, batchIndex, lane], index) => [
+        String(index),
+        evolveNode({
+          id: index,
+          name: `round-${batchIndex}`,
+          parent: index === 0 ? [] : [index - 1],
+          score,
+          analysis: `analysis ${index}`,
+          batchIndex,
+          lane,
+        }),
+      ]),
+    );
+    writeNodesFile(resolve(runDir, 'database_data'), nodes, false);
+  }
+
+  it('counts one workers:3 batch as a single generation: patience not tripped after one no-improvement batch', () => {
+    // Finding-B repro: 3 lane nodes step_0001_lane_0/1/2, identical score, no
+    // improvement over baseline. Node-denominated, this is 3 rounds and would
+    // trip patience:2; generation-denominated it is ONE generation, so
+    // rounds_since_improvement is 0/1 (the batch set the best) and patience holds.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'gen-one-batch-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 2 });
+    writeGenerationNodes(runDir, [
+      [5, 1, 0],
+      [5, 1, 1],
+      [5, 1, 2],
+    ]);
+
+    const { result } = runBridge(scriptsDir, ['compute_stop_signals', '--run-dir', runDir]);
+    expect(result).toMatchObject({ verdict: 'stop_signals_computed', passed: true });
+
+    const signals = readStopSignals(runDir);
+    expect(signals).toMatchObject({
+      done_rounds: 1,
+      node_count: 3,
+      rounds_since_improvement: 0,
+      patience: 2,
+      patience_exceeded: false,
+      stop_reason: null,
+    });
+  });
+
+  it('resets the generation plateau counter when a later batch improves the running best', () => {
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'gen-improve-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 2 });
+    // Batch 1 (best 5) sets the running best; batch 2 (best 9) improves it.
+    writeGenerationNodes(runDir, [
+      [5, 1, 0],
+      [4, 1, 1],
+      [9, 2, 0],
+      [9, 2, 1],
+    ]);
+
+    runBridge(scriptsDir, ['compute_stop_signals', '--run-dir', runDir]);
+    const signals = readStopSignals(runDir);
+    expect(signals).toMatchObject({
+      done_rounds: 2,
+      node_count: 4,
+      best_score: 9,
+      rounds_since_improvement: 0,
+      patience_exceeded: false,
+      stop_reason: null,
+    });
+  });
+
+  it('trips patience after `patience` generations with no improvement, counting batches not nodes', () => {
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'gen-plateau-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 2 });
+    // 3 batches, none improves on batch 1's best 5. Generation-denominated:
+    // gen0 sets best (rsi=0), gen1 +1, gen2 +1 -> rsi=2 == patience -> trip.
+    writeGenerationNodes(runDir, [
+      [5, 1, 0],
+      [5, 1, 1],
+      [5, 2, 0],
+      [5, 2, 1],
+      [5, 3, 0],
+      [5, 3, 1],
+    ]);
+
+    runBridge(scriptsDir, ['compute_stop_signals', '--run-dir', runDir]);
+    const signals = readStopSignals(runDir);
+    expect(signals).toMatchObject({
+      done_rounds: 3,
+      node_count: 6,
+      rounds_since_improvement: 2,
+      patience_exceeded: true,
+      stop_reason: 'patience',
+    });
+  });
+
+  it('is byte-identical to node-denominated counters at workers:1 (every step_<N> node is its own generation)', () => {
+    // Backward-compat invariant: a legacy workers:1 sequence (all `step_<N>`, no
+    // lane suffix) yields generation-count == node-count and generations-since-
+    // improvement == nodes-since-improvement. Hand-computed node-denominated
+    // values: best 2 reached at node 1 (step_0002); nodes 2 and 3 do not improve,
+    // so rounds_since_improvement == 2 == patience -> patience. done_rounds == 4.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'gen-workers1-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 2 });
+    writeGenerationNodes(runDir, [
+      [1, 1],
+      [2, 2],
+      [2, 3],
+      [2, 4],
+    ]);
+
+    runBridge(scriptsDir, ['compute_stop_signals', '--run-dir', runDir]);
+    const signals = readStopSignals(runDir);
+    expect(signals).toMatchObject({
+      best_score: 2,
+      best_node_id: 1,
+      done_rounds: 4,
+      node_count: 4,
+      rounds_since_improvement: 2,
+      patience_exceeded: true,
+      stop_reason: 'patience',
+    });
+  });
+
+  it('two concurrent lane attach_analysis calls never clobber the barrier-owned canonical stop_signals', async () => {
+    // The race made concrete: two lanes recording at once, each with its own
+    // EVOLVE_LANE, both leave the canonical file's sentinel intact.
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'concurrent-lane-stop-signals-run');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 5 });
+    writeNodes(runDir, [1, 2], 1);
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    const sentinel = '{"stop_reason":"barrier_owned_sentinel"}\n';
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), sentinel);
+
+    const results = await Promise.all(
+      [0, 1].map((lane) => {
+        const laneDir = resolve(runDir, 'current', `lane_${lane}`);
+        mkdirSync(laneDir, { recursive: true });
+        const analysisFile = resolve(laneDir, 'analysis.md');
+        writeFileSync(analysisFile, `lane ${lane} analysis\n`);
+        return runBridgeAsync(
+          scriptsDir,
+          [
+            'attach_analysis',
+            '--run-dir',
+            runDir,
+            '--lane',
+            String(lane),
+            '--step-name',
+            `step_000${lane + 1}`,
+            '--analysis-file',
+            analysisFile,
+          ],
+          resolve(tmpDir, `stop-lane-${lane}.json`),
+          { EVOLVE_LANE: String(lane) },
+        );
+      }),
+    );
+
+    expect(results.map((r) => r.result.verdict)).toEqual(['recorded', 'recorded']);
+    expect(results.map((r) => r.stderr)).toEqual(['', '']);
+    expect(readFileSync(resolve(runDir, 'current', 'stop_signals.json'), 'utf-8')).toBe(sentinel);
+    for (const lane of [0, 1]) {
+      expect(existsSync(resolve(runDir, 'current', `lane_${lane}`, 'stop_signals.json'))).toBe(true);
+    }
+  });
+
   it('samples with an empty DB without reseeding a non-empty cognition store', () => {
     const runDir = resolve(tmpDir, 'empty-sample-run');
     writeRunSpec(runDir);
@@ -1122,6 +1841,50 @@ describe('evolve_result.py bridge', () => {
     expect(result).toMatchObject({ verdict: 'evaluated', passed: true });
     expect(argv).toEqual(expect.arrayContaining(['--step-name', 'step_0003']));
     expect(argv).toEqual(expect.arrayContaining(['--code-path', '.evolve_runs/main/steps/step_0003/code']));
+  });
+
+  it('resolves current-round flags from the selected lane', () => {
+    const runDir = resolve(tmpDir, 'workspace', '.evolve_runs', 'main');
+    const laneDir = resolve(runDir, 'current', 'lane_3');
+    mkdirSync(laneDir, { recursive: true });
+    writeFileSync(resolve(laneDir, 'step_name'), 'step_0005_lane_3\n');
+    const evalStub = [
+      'import json, sys',
+      'from pathlib import Path',
+      "run_dir = Path(sys.argv[sys.argv.index('--run-dir') + 1])",
+      "Path(run_dir / 'eval-argv.json').write_text(json.dumps(sys.argv), encoding='utf-8')",
+      "step = sys.argv[sys.argv.index('--step-name') + 1]",
+      "result = run_dir / 'steps' / step / 'results.json'",
+      'result.parent.mkdir(parents=True, exist_ok=True)',
+      "result.write_text(json.dumps({'eval_score': 5, 'success': True}), encoding='utf-8')",
+      "print(json.dumps({'results_path': str(result), 'return_code': 0, 'step_dir': str(result.parent), 'success': True}))",
+    ].join('\n');
+    const scriptsDir = writeHarness({ evalStub: evalStub + '\n' });
+
+    const { result } = runBridge(scriptsDir, [
+      'evaluate',
+      '--run-dir',
+      runDir,
+      '--lane',
+      '3',
+      '--step-from-current',
+      '--code-from-current',
+    ]);
+
+    const argv = JSON.parse(readFileSync(resolve(runDir, 'eval-argv.json'), 'utf-8')) as string[];
+    expect(result).toMatchObject({ verdict: 'evaluated', passed: true });
+    expect(argv).toEqual(expect.arrayContaining(['--step-name', 'step_0005_lane_3']));
+    expect(argv).toEqual(expect.arrayContaining(['--code-path', '.evolve_runs/main/steps/step_0005_lane_3/code']));
+  });
+
+  it('accepts lane-scoped result paths under the same containment checks as deterministic result files', () => {
+    const workspace = resolve(tmpDir, 'workspace');
+    const relativeResultFile = '.evolve_runs/main/current/lane_0/result.json';
+    const absoluteResultFile = resolve(workspace, relativeResultFile);
+    mkdirSync(resolve(workspace, '.evolve_runs', 'main', 'current', 'lane_0'), { recursive: true });
+
+    expect(isSafeWorkspaceRelativePath(relativeResultFile)).toBe(true);
+    expect(isWithinDirectory(absoluteResultFile, workspace)).toBe(true);
   });
 
   it('attaches analysis with the sampled parent and omits parent when context has none', () => {
