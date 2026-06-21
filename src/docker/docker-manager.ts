@@ -10,7 +10,7 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ContainerRuntime, DockerContainerConfig, DockerExecResult } from './types.js';
 import * as logger from '../logger.js';
-import { checkDockerAvailable, type DockerAvailability } from '../session/preflight.js';
+import { checkDockerAvailable, type DockerAvailability } from './docker-probe.js';
 import { isExecError, isExecTimeout } from '../utils/exec-error.js';
 import { spawnWithIdleTimeout, type SpawnFn } from './spawn-with-idle-timeout.js';
 import {

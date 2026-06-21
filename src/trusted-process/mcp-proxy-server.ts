@@ -618,12 +618,25 @@ async function main(): Promise<void> {
       // the relay — a startup failure never silently widens or narrows
       // policy, since unregistered tools are denied by default.
       const cmd = `${wrapped.command} ${wrapped.args.join(' ')}`;
-      const stderrSnippet = serverStderr ? ` Server stderr: ${serverStderr.substring(0, 1000)}` : '';
+      // Redact credentials/OAuth env from the captured stderr before it
+      // reaches emitProxyDiagnostic (which persists to the session log),
+      // matching the redaction the streaming stderr handler applies above.
+      const redactedStderr = redactCredentials(redactCredentials(serverStderr, serverCredentials), oauthEnv);
+      const stderrSnippet = redactedStderr ? ` Server stderr: ${redactedStderr.substring(0, 1000)}` : '';
       emitProxyDiagnostic(
         'WARNING',
         `Skipping MCP server "${serverName}": failed to connect (${cmd}): ${err instanceof Error ? err.message : String(err)}${stderrSnippet}`,
         sessionLogPath,
       );
+      // This server is being skipped; stop the OAuth refresher started for it
+      // above so it does not keep running force-refresh loops for a backend
+      // that never connected (shutdown-time cleanup would otherwise be the
+      // only thing that stops it).
+      const orphanedRefresher = tokenRefreshers.get(serverName);
+      if (orphanedRefresher) {
+        orphanedRefresher.stop();
+        tokenRefreshers.delete(serverName);
+      }
       continue;
     }
     clientStates.set(serverName, state);

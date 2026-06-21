@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process';
 import { arch, platform } from 'node:os';
 import { checkSandboxViability } from '../utils/preflight-checks.js';
-import { checkDockerAvailable, type DockerAvailability } from '../session/preflight.js';
+import { checkDockerAvailable, type DockerAvailability } from '../docker/docker-probe.js';
 import { checkAppleContainerAvailable } from '../docker/apple-container-manager.js';
 import { resolveRuntimeKind, type ContainerRuntimeKind } from '../docker/container-runtime.js';
 import { detectAuthMethod, readOnlyCredentialSources } from '../docker/oauth-credentials.js';

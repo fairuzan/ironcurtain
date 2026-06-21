@@ -1072,7 +1072,7 @@ describe('ensureWorkflowImage no-manifest fast path', () => {
 
   // The mock Docker stamps build labels per tag; we assert no per-workflow
   // image tag (`ironcurtain-wf-*`) is ever built on the fast path.
-  function builtWorkflowImageTags(docker: DockerManager): string[] {
+  function builtWorkflowImageTags(docker: ContainerRuntime): string[] {
     const built: string[] = [];
     const original = docker.buildImage.bind(docker);
     docker.buildImage = async (tag, df, ctx, labels) => {

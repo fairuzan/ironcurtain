@@ -14,7 +14,6 @@
  */
 
 import { createConnection, createServer } from 'node:net';
-import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import chalk from 'chalk';
@@ -27,6 +26,7 @@ import { validateWorkspacePath } from '../session/workspace-validation.js';
 import { CONTAINER_WORKSPACE_DIR } from './agent-adapter.js';
 import { PTY_SOCK_NAME, DEFAULT_PTY_PORT } from './pty-types.js';
 import type { PtySessionRegistration, SessionSnapshot } from './pty-types.js';
+import type { ContainerRuntime } from './types.js';
 import { createEscalationWatcher, atomicWriteJsonSync } from '../escalation/escalation-watcher.js';
 import type { EscalationWatcher } from '../escalation/escalation-watcher.js';
 import { getSessionDir, getSessionCapturesDir, getPtyRegistryDir, SESSION_STATE_FILENAME } from '../config/paths.js';
@@ -70,6 +70,14 @@ export interface PtyProxyOptions {
   readonly target: PtyTarget;
   /** Docker container ID (for SIGWINCH forwarding). */
   readonly containerId: string;
+  /**
+   * Active container runtime used for in-container PTY resize/verify execs.
+   * Routing through the runtime (rather than a hardcoded `docker exec`) keeps
+   * size management working on non-Docker backends (e.g. Apple `container`).
+   * Optional so error-path tests can drive `attachPty` without a runtime;
+   * when absent, PTY size management is skipped.
+   */
+  readonly runtime?: ContainerRuntime;
   /** Abort signal for graceful shutdown (e.g., SIGTERM). */
   readonly signal?: AbortSignal;
 }
@@ -682,6 +690,7 @@ export async function runPtySession(options: PtySessionOptions): Promise<void> {
     const exitCode = await attachFn({
       target: ptyTarget,
       containerId,
+      runtime: docker,
       signal: shutdownController.signal,
     });
     ptyExitCode = exitCode;
@@ -881,39 +890,31 @@ function attachPtyOnce(options: PtyProxyOptions): Promise<number> {
       const verifyAbort = new AbortController();
       let isFirstResize = true;
 
+      const runtime = options.runtime;
       const onResize = (): void => {
         const { columns, rows } = stdout;
-        if (columns && rows) {
+        if (columns && rows && runtime) {
           if (!isFirstResize) {
             verifyAbort.abort();
           }
           isFirstResize = false;
-          execFile(
-            'docker',
-            [
-              'exec',
-              // The container may be running as root (Linux UID-remap path,
-              // issue #232) or as codespace (macOS). Pinning the exec user
-              // to codespace works in both cases — codespace is the baked
-              // user (renumbered, but the username is unchanged) and
-              // re-asserting it under macOS is a no-op.
-              '--user',
-              'codespace',
-              options.containerId,
-              '/etc/ironcurtain/resize-pty.sh',
-              String(columns),
-              String(rows),
-            ],
-            { timeout: 5000 },
-            (err, _stdout, stderr) => {
-              if (err) {
-                logger.warn(`resize-pty.sh failed: ${err.message}`);
-                if (stderr) {
-                  logger.warn(`resize-pty.sh stderr: ${stderr.trim()}`);
+          // Route through the active runtime (docker or Apple `container`).
+          // `exec` defaults `--user` to codespace, which is correct whether
+          // the container runs as root (Linux UID-remap path, issue #232) or
+          // as codespace (macOS); re-asserting codespace there is a no-op.
+          void runtime
+            .exec(options.containerId, ['/etc/ironcurtain/resize-pty.sh', String(columns), String(rows)], 5000)
+            .then((res) => {
+              if (res.exitCode !== 0) {
+                logger.warn(`resize-pty.sh failed (exit ${res.exitCode})`);
+                if (res.stderr) {
+                  logger.warn(`resize-pty.sh stderr: ${res.stderr.trim()}`);
                 }
               }
-            },
-          );
+            })
+            .catch((err: unknown) => {
+              logger.warn(`resize-pty.sh failed: ${err instanceof Error ? err.message : String(err)}`);
+            });
         }
       };
 
@@ -953,8 +954,8 @@ function attachPtyOnce(options: PtyProxyOptions): Promise<number> {
         // Background verify+retry to ensure the initial resize took effect.
         // Fire-and-forget -- does not block the PTY proxy.
         // Canceled via verifyAbort when the user resizes the terminal.
-        if (stdout.columns && stdout.rows) {
-          void verifyInitialPtySize(options.containerId, stdout.columns, stdout.rows, verifyAbort.signal);
+        if (runtime && stdout.columns && stdout.rows) {
+          void verifyInitialPtySize(runtime, options.containerId, stdout.columns, stdout.rows, verifyAbort.signal);
         }
       });
 
@@ -1005,34 +1006,30 @@ const PTY_SIZE_VERIFY_INTERVAL_MS = 1_000;
 const PTY_SIZE_VERIFY_INITIAL_DELAY_MS = 500;
 
 /**
- * Runs check-pty-size.sh and returns { rows, cols } or null on failure.
+ * Runs check-pty-size.sh via the active runtime and returns { rows, cols }
+ * or null on failure.
  */
-function checkPtySize(containerId: string): Promise<{ rows: number; cols: number } | null> {
-  return new Promise((resolve) => {
-    execFile(
-      'docker',
-      // `--user codespace` mirrors ContainerRuntime.exec; see the resize
-      // callsite above for the issue #232 rationale.
-      ['exec', '--user', 'codespace', containerId, '/etc/ironcurtain/check-pty-size.sh'],
-      { timeout: 5000 },
-      (err, stdout) => {
-        if (err) {
-          resolve(null);
-          return;
-        }
-        const parts = stdout.trim().split(/\s+/);
-        if (parts.length >= 2) {
-          const rows = parseInt(parts[0], 10);
-          const cols = parseInt(parts[1], 10);
-          if (!isNaN(rows) && !isNaN(cols) && rows > 0 && cols > 0) {
-            resolve({ rows, cols });
-            return;
-          }
-        }
-        resolve(null);
-      },
-    );
-  });
+async function checkPtySize(
+  runtime: ContainerRuntime,
+  containerId: string,
+): Promise<{ rows: number; cols: number } | null> {
+  try {
+    // `exec` defaults `--user` to codespace; see the resize callsite for the
+    // issue #232 rationale.
+    const res = await runtime.exec(containerId, ['/etc/ironcurtain/check-pty-size.sh'], 5000);
+    if (res.exitCode !== 0) return null;
+    const parts = res.stdout.trim().split(/\s+/);
+    if (parts.length >= 2) {
+      const rows = parseInt(parts[0], 10);
+      const cols = parseInt(parts[1], 10);
+      if (!isNaN(rows) && !isNaN(cols) && rows > 0 && cols > 0) {
+        return { rows, cols };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1041,6 +1038,7 @@ function checkPtySize(containerId: string): Promise<{ rows: number; cols: number
  * does not fight with legitimate SIGWINCH-driven resizes.
  */
 async function verifyInitialPtySize(
+  runtime: ContainerRuntime,
   containerId: string,
   expectedCols: number,
   expectedRows: number,
@@ -1051,31 +1049,18 @@ async function verifyInitialPtySize(
   for (let attempt = 0; attempt < PTY_SIZE_VERIFY_RETRIES; attempt++) {
     if (signal?.aborted) return;
 
-    const size = await checkPtySize(containerId);
+    const size = await checkPtySize(runtime, containerId);
     if (size && size.cols === expectedCols && size.rows === expectedRows) {
       return; // PTY size matches
     }
 
     if (signal?.aborted) return;
 
-    // Mismatch or check failed -- try resizing
-    await new Promise<void>((resolve) => {
-      execFile(
-        'docker',
-        // `--user codespace` mirrors ContainerRuntime.exec; see issue #232.
-        [
-          'exec',
-          '--user',
-          'codespace',
-          containerId,
-          '/etc/ironcurtain/resize-pty.sh',
-          String(expectedCols),
-          String(expectedRows),
-        ],
-        { timeout: 5000 },
-        () => resolve(),
-      );
-    });
+    // Mismatch or check failed -- try resizing via the active runtime.
+    // `exec` defaults `--user` to codespace; see issue #232.
+    await runtime
+      .exec(containerId, ['/etc/ironcurtain/resize-pty.sh', String(expectedCols), String(expectedRows)], 5000)
+      .catch(() => undefined);
 
     // Wait before rechecking
     await new Promise((r) => setTimeout(r, PTY_SIZE_VERIFY_INTERVAL_MS));
@@ -1084,7 +1069,7 @@ async function verifyInitialPtySize(
   if (signal?.aborted) return;
 
   // Final check
-  const finalSize = await checkPtySize(containerId);
+  const finalSize = await checkPtySize(runtime, containerId);
   if (!finalSize || finalSize.cols !== expectedCols || finalSize.rows !== expectedRows) {
     logger.warn(
       `PTY size verification failed after ${PTY_SIZE_VERIFY_RETRIES} retries ` +

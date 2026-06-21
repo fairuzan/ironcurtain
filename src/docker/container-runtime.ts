@@ -11,7 +11,7 @@
  */
 
 import type { ContainerRuntime } from './types.js';
-import type { DockerAvailability } from '../session/preflight.js';
+import type { DockerAvailability } from './docker-probe.js';
 import type { ContainerRuntimeSetting } from '../config/user-config.js';
 import { createDockerManager } from './docker-manager.js';
 import { createAppleContainerManager, checkAppleContainerAvailable } from './apple-container-manager.js';

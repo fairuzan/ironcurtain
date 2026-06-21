@@ -122,22 +122,43 @@ export async function createHostOnlyNetwork(docker: ContainerRuntime, name: stri
   );
 }
 
+/** Minimum interval between rejected-connection warnings per guard (ms). */
+const REJECTION_WARN_WINDOW_MS = 60_000;
+
 /**
  * Builds a connection-source predicate admitting only the given /24
  * subnet plus loopback. Used by the proxies when listening on 0.0.0.0
  * in `tcp-hostonly` mode so the agent VM can connect but other LAN/host
  * processes cannot (the code-mode proxy is unauthenticated; see module
  * doc). Handles IPv4-mapped IPv6 forms (`::ffff:a.b.c.d`).
+ *
+ * Because these proxies bind 0.0.0.0, incidental LAN traffic and port
+ * scans can drive a high rate of rejections. To avoid unbounded log
+ * churn, rejection warnings are rate-limited to one per
+ * `REJECTION_WARN_WINDOW_MS`, with a suppressed-count summary.
  */
 export function makeSourceAddressGuard(subnet: string): (remoteAddress: string | undefined) => boolean {
   const prefix = subnet.split('/')[0].split('.').slice(0, 3).join('.') + '.';
+  let suppressedSinceWarn = 0;
+  let lastWarnMs = 0;
   return (remoteAddress: string | undefined): boolean => {
     if (!remoteAddress) return false;
     const addr = remoteAddress.startsWith('::ffff:') ? remoteAddress.slice('::ffff:'.length) : remoteAddress;
     if (addr === '127.0.0.1' || addr === '::1') return true;
     const allowed = addr.startsWith(prefix);
     if (!allowed) {
-      logger.warn(`[network-topology] rejected connection from outside the bundle subnet: ${remoteAddress}`);
+      const now = Date.now();
+      if (now - lastWarnMs >= REJECTION_WARN_WINDOW_MS) {
+        const suffix =
+          suppressedSinceWarn > 0
+            ? ` (${suppressedSinceWarn} more suppressed in the last ${REJECTION_WARN_WINDOW_MS / 1000}s)`
+            : '';
+        logger.warn(`[network-topology] rejected connection from outside the bundle subnet: ${remoteAddress}${suffix}`);
+        lastWarnMs = now;
+        suppressedSinceWarn = 0;
+      } else {
+        suppressedSinceWarn++;
+      }
     }
     return allowed;
   };

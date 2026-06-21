@@ -25,7 +25,7 @@
 import { arch, platform, release } from 'node:os';
 import type { ContainerRuntime, DockerContainerConfig, DockerExecResult } from './types.js';
 import * as logger from '../logger.js';
-import type { DockerAvailability } from '../session/preflight.js';
+import type { DockerAvailability } from './docker-probe.js';
 import { isExecError, isExecTimeout } from '../utils/exec-error.js';
 import { spawnWithIdleTimeout } from './spawn-with-idle-timeout.js';
 import {

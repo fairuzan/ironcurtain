@@ -10,7 +10,7 @@ import {
 import { type ExecFileFn } from '../src/docker/docker-manager.js';
 import type { SpawnFn } from '../src/docker/spawn-with-idle-timeout.js';
 import type { DockerContainerConfig } from '../src/docker/types.js';
-import type { DockerAvailability } from '../src/session/preflight.js';
+import type { DockerAvailability } from '../src/docker/docker-probe.js';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 
 type ExecCall = {

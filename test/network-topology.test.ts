@@ -7,7 +7,7 @@ import {
   HOST_ONLY_SUBNET_POOL,
 } from '../src/docker/network-topology.js';
 import { resolveRuntimeKind, resetRuntimeKindResolutionForTests } from '../src/docker/container-runtime.js';
-import type { DockerAvailability } from '../src/session/preflight.js';
+import type { DockerAvailability } from '../src/docker/docker-probe.js';
 import type { ContainerRuntime } from '../src/docker/types.js';
 
 function overlapError(subnet: string): Error {
