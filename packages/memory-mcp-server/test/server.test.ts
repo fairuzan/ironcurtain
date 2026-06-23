@@ -4,9 +4,15 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { MemoryEngine } from '../src/engine.js';
 import { createServer } from '../src/server.js';
 
-function createMockEngine(): MemoryEngine {
+function createMockEngine(overrides: Partial<MemoryEngine> = {}): MemoryEngine {
   return {
     store: vi.fn().mockResolvedValue({ id: 'test-id', action: 'created' }),
+    ingest: vi.fn().mockResolvedValue({
+      created: 1,
+      merged: 0,
+      memory_ids: ['test-id'],
+      facts: [{ fact: 'A fact', importance: 0.5 }],
+    }),
     recall: vi.fn().mockResolvedValue({
       content: 'test recall',
       memories_used: 1,
@@ -24,7 +30,13 @@ function createMockEngine(): MemoryEngine {
       storage_bytes: 4096,
       top_tags: [],
     }),
+    expand: vi.fn().mockResolvedValue({
+      segment_id: 'seg-1',
+      passages: ['Source passage one.', 'Source passage two.'],
+      found: true,
+    }),
     close: vi.fn(),
+    ...overrides,
   };
 }
 
@@ -40,14 +52,22 @@ async function createConnectedClient(engine: MemoryEngine) {
 }
 
 describe('MCP server', () => {
-  it('lists all 5 memory tools', async () => {
+  it('lists all 7 memory tools', async () => {
     const engine = createMockEngine();
     const { client } = await createConnectedClient(engine);
 
     const { tools } = await client.listTools();
     const toolNames = tools.map((t) => t.name).sort();
 
-    expect(toolNames).toEqual(['memory_context', 'memory_forget', 'memory_inspect', 'memory_recall', 'memory_store']);
+    expect(toolNames).toEqual([
+      'memory_context',
+      'memory_expand',
+      'memory_forget',
+      'memory_ingest',
+      'memory_inspect',
+      'memory_recall',
+      'memory_store',
+    ]);
   });
 
   it('memory_store tool has correct schema', async () => {
@@ -72,6 +92,25 @@ describe('MCP server', () => {
     expect(recallTool).toBeDefined();
     expect(recallTool!.description).toContain('Recall memories');
     expect(recallTool!.inputSchema.required).toContain('query');
+  });
+
+  it('memory_ingest tool has correct schema', async () => {
+    const engine = createMockEngine();
+    const { client } = await createConnectedClient(engine);
+
+    const { tools } = await client.listTools();
+    const ingestTool = tools.find((t) => t.name === 'memory_ingest');
+
+    expect(ingestTool).toBeDefined();
+    expect(ingestTool!.inputSchema.required).toContain('content');
+
+    // Everything except `content` is optional.
+    const required = ingestTool!.inputSchema.required ?? [];
+    const properties = ingestTool!.inputSchema.properties ?? {};
+    for (const optional of ['mode', 'dry_run', 'as_of', 'on_extraction_failure', 'tags', 'importance', 'source']) {
+      expect(properties).toHaveProperty(optional);
+      expect(required).not.toContain(optional);
+    }
   });
 
   it('memory_context tool has no required params', async () => {
@@ -117,8 +156,39 @@ describe('MCP server', () => {
       token_budget: undefined,
       tags: undefined,
       format: undefined,
+      expand: 'auto',
+      max_expand_passages: undefined,
     });
     expect(result.content).toEqual([{ type: 'text', text: 'test recall' }]);
+  });
+
+  it('surfaces expansion metadata in the memory_recall tool result', async () => {
+    const engine = createMockEngine({
+      recall: vi.fn().mockResolvedValue({
+        content: 'expanded recall',
+        memories_used: 3,
+        total_matches: 12,
+        expanded: true,
+        expanded_segment_ids: ['seg-a', 'seg-b'],
+      }),
+    });
+    const { client } = await createConnectedClient(engine);
+
+    const result = await client.callTool({
+      name: 'memory_recall',
+      arguments: { query: 'contract clauses' },
+    });
+
+    // Human-readable text is preserved exactly as the recall content.
+    expect(result.content).toEqual([{ type: 'text', text: 'expanded recall' }]);
+    // The agent-facing expansion handles ride on structuredContent, available in
+    // every format (the engine-only metadata is now reachable by MCP callers).
+    expect(result.structuredContent).toEqual({
+      memories_used: 3,
+      total_matches: 12,
+      expanded: true,
+      expanded_segment_ids: ['seg-a', 'seg-b'],
+    });
   });
 
   it('calls engine.context via memory_context tool', async () => {

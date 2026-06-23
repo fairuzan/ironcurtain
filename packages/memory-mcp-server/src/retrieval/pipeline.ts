@@ -4,16 +4,11 @@ import type { MemoryConfig } from '../config.js';
 import type { RecallOptions } from '../types.js';
 import { vectorSearch, ftsSearch, updateAccessStats, getEmbeddingsForMemories } from '../storage/queries.js';
 import { embedQuery } from '../embedding/embedder.js';
-import {
-  hybridScoreFusion,
-  computeCompositeScore,
-  filterByRelevance,
-  filterByRerankerScore,
-  packToBudget,
-} from './scoring.js';
+import { hybridScoreFusion, computeCompositeScore, filterByRelevance, filterByRerankerScore } from './scoring.js';
 import { deduplicateByEmbedding } from './dedup.js';
 import { rerank } from './reranker.js';
 import { formatMemories } from './formatting.js';
+import { expandKeptFacts, realMemoryId } from './expansion.js';
 import { parseTags } from '../utils/tags.js';
 
 const DEFAULT_CANDIDATE_LIMIT = 50;
@@ -21,12 +16,19 @@ const DEFAULT_CANDIDATE_LIMIT = 50;
  *  0.9 = cosine similarity > 0.1; generous enough for vague queries while filtering pure noise. */
 const MAX_VECTOR_DISTANCE = 0.9;
 
+/** Default cap on expanded passages across one result (§5.4). */
+const DEFAULT_MAX_EXPAND_PASSAGES = 2;
+
 /** Internal result from the retrieval pipeline, richer than the public RecallResult. */
 export interface PipelineRecallResult {
   text: string;
   memoryIds: string[];
   totalCandidates: number;
   selectedCount: number;
+  /** True when any returned display unit was an expanded parent passage. */
+  expanded: boolean;
+  /** The segment_ids that were expanded (empty when none). */
+  expandedSegmentIds: string[];
 }
 
 /**
@@ -38,7 +40,14 @@ export async function recall(
   config: MemoryConfig,
   options: Omit<RecallOptions, 'namespace'>,
 ): Promise<PipelineRecallResult> {
-  const { query, token_budget: tokenBudget = config.defaultTokenBudget, tags, format = 'summary' } = options;
+  const {
+    query,
+    token_budget: tokenBudget = config.defaultTokenBudget,
+    tags,
+    format = 'summary',
+    expand = 'auto',
+    max_expand_passages: maxExpandPassages = DEFAULT_MAX_EXPAND_PASSAGES,
+  } = options;
 
   // 1. Embed query (with asymmetric prefix for retrieval-optimized embedding)
   const queryEmbedding = await embedQuery(query, config);
@@ -63,6 +72,8 @@ export async function recall(
       memoryIds: [],
       totalCandidates: 0,
       selectedCount: 0,
+      expanded: false,
+      expandedSegmentIds: [],
     };
   }
 
@@ -113,25 +124,46 @@ export async function recall(
   // 8. Dedup
   const { kept } = deduplicateByEmbedding(afterRerankerFilter, embeddings);
 
-  // 9. Token budget packing
-  const selected = packToBudget(kept, tokenBudget);
+  // 9b + 9. Parent re-expansion AND budget packing (return-shaping only; the ranker
+  //     above is untouched). For expand:'none' this is a byte-for-byte `packToBudget`
+  //     over `kept` as facts. For expand:'auto'|'parent' it reserves budget for the top
+  //     passage so depth is guaranteed, packs the breadth facts into the remainder so the
+  //     top facts are never evicted, then fills leftover — returning the final packed list.
+  const { units: selected, expandedSegmentIds } = await expandKeptFacts(
+    db,
+    config,
+    kept,
+    queryEmbedding,
+    expand,
+    maxExpandPassages,
+    tokenBudget,
+  );
 
-  // 10. Format — reuse embeddings already loaded for dedup
-  const selectedIds = new Set(selected.map((m) => m.id));
+  // 10. Format — reuse embeddings already loaded for dedup. A passage unit carries the
+  //     synthetic id `<factId>#seg:<segId>`, so resolve each selected unit to its REAL
+  //     memory id to fetch the embedding, keyed by the unit's own id — so the no-LLM
+  //     extractive-clustering path still clusters the passage by its host fact's vector.
   const selectedEmbeddings = new Map<string, Float32Array>();
-  for (const [id, emb] of embeddings) {
-    if (selectedIds.has(id)) selectedEmbeddings.set(id, emb);
+  for (const unit of selected) {
+    const emb = embeddings.get(realMemoryId(unit.id));
+    if (emb !== undefined) selectedEmbeddings.set(unit.id, emb);
   }
   const text = await formatMemories(selected, selectedEmbeddings, query, tokenBudget, format, config);
 
-  // 11. Update access stats for returned memories
-  const returnedIds = selected.map((m) => m.id);
-  updateAccessStats(db, config.namespace, returnedIds);
+  // 11. Update access stats. Resolve passage units' synthetic ids back to their host fact's
+  //     real memory id and de-duplicate — so a fact present as both a fact unit and a passage
+  //     unit is counted once, and the host fact is still counted when only the passage fit.
+  const realIds = [...new Set(selected.map((m) => realMemoryId(m.id)))];
+  updateAccessStats(db, config.namespace, realIds);
 
+  // `expandKeptFacts` packs facts + passages itself, so `expandedSegmentIds` already
+  // reflects only the passages that survived into the returned set.
   return {
     text,
-    memoryIds: returnedIds,
+    memoryIds: realIds,
     totalCandidates: allMemories.size,
     selectedCount: selected.length,
+    expanded: expandedSegmentIds.length > 0,
+    expandedSegmentIds,
   };
 }
