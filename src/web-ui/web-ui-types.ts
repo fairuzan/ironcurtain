@@ -8,6 +8,15 @@ import type { JobDefinition, RunRecord } from '../cron/types.js';
 import type { WhitelistCandidateIpc } from '../trusted-process/approval-whitelist.js';
 import type { WorkflowId, HumanGateRequestDto } from '../workflow/types.js';
 import type { MessageLogEntry } from '../workflow/message-log.js';
+// TYPE-ONLY import of the 9-value pipeline phase union. The import-boundary
+// rule (test/pipeline-import-boundary.test.ts + ESLint no-restricted-imports)
+// forbids VALUE imports from pipeline/* on the live path; `import type` is the
+// sanctioned contract import and creates no runtime edge.
+import type { CompilationPhase } from '../pipeline/pipeline-shared.js';
+
+// Re-export the phase union so the frontend mirror and event consumers can name
+// it without reaching into the pipeline package directly.
+export type { CompilationPhase } from '../pipeline/pipeline-shared.js';
 
 // Re-export MessageLogEntry so frontends can import it from the wire-types
 // module without reaching into the workflow domain package directly.
@@ -59,7 +68,17 @@ export type MethodName =
   | 'workflows.messageLog'
   | 'workflows.readme'
   | 'personas.get'
-  | 'personas.compile';
+  // Phase 1b: streamed long-running compile (fire-and-return) + its read methods.
+  | 'personas.compileStream'
+  | 'personas.getCompile'
+  | 'personas.listCompiles'
+  // Phase 1c: full persona CRUD (all mutation methods; require the
+  // `--allow-policy-mutation` kill switch, else POLICY_MUTATION_FORBIDDEN).
+  | 'personas.create'
+  | 'personas.editConstitution'
+  | 'personas.setMemory'
+  | 'personas.delete'
+  | 'personas.setBroadPolicyOptIn';
 
 /** Browser -> Daemon request frame. */
 export interface RequestFrame {
@@ -103,7 +122,20 @@ export type ErrorCode =
   | 'RATE_LIMITED'
   | 'METHOD_NOT_FOUND'
   | 'LINT_FAILED'
-  | 'INTERNAL_ERROR';
+  | 'INTERNAL_ERROR'
+  // Phase 1b persona-compile error codes.
+  | 'COMPILE_IN_PROGRESS'
+  | 'COMPILE_QUEUE_FULL'
+  | 'CREDENTIALS_MISSING'
+  | 'LIST_REQUIRES_MCP'
+  | 'POLICY_MUTATION_FORBIDDEN'
+  // Phase 1c persona-CRUD error codes.
+  // PERSONA_EXISTS: `personas.create` against an existing persona dir (after branding).
+  // BROAD_POLICY_REJECTED: the broad-policy validator rejected a compiled policy
+  //   (`'*'` domain/list or out-of-workspace path) without `allowBroadPolicy`;
+  //   surfaced terminally via the `persona.compile.failed` event.
+  | 'PERSONA_EXISTS'
+  | 'BROAD_POLICY_REJECTED';
 
 // ---------------------------------------------------------------------------
 // DTO Types
@@ -164,6 +196,14 @@ export interface DaemonStatusDto {
   readonly webUiListening: boolean;
   readonly activeSessions: number;
   readonly nextFireTime: string | null;
+  /**
+   * Whether the daemon was launched with `--allow-policy-mutation` (Phase 1c).
+   * Populated by `buildStatusDto` from `ctx.allowPolicyMutation`. The frontend
+   * uses this to HIDE all persona-mutation controls when the kill switch is
+   * off — when off, every mutation method returns POLICY_MUTATION_FORBIDDEN.
+   * Off by default, CLI-only, not config-persisted.
+   */
+  readonly allowPolicyMutation: boolean;
 }
 
 /** Job list entry with scheduling and last-run info. */
@@ -386,13 +426,125 @@ export interface PersonaDetailDto {
   readonly servers?: readonly string[];
   readonly hasPolicy: boolean;
   readonly policyRuleCount?: number;
+  /**
+   * Whether persistent memory is enabled for this persona
+   * (persona.memory?.enabled ?? true). Added in Phase 1a; additive and
+   * backward-compatible — existing callers ignore unknown fields.
+   */
+  readonly memory: boolean;
+  /**
+   * Whether this persona is authorized to compile a "broad" policy
+   * (persona.allowBroadPolicy ?? false). When false, the broad-policy
+   * validator rejects compiled policies containing a `'*'` domain/list or an
+   * out-of-workspace `paths.within`. Set ONLY via the gated
+   * `personas.setBroadPolicyOptIn` method — never inferred from the
+   * constitution. Added in Phase 1c. (Source: src/persona/types.ts
+   * PersonaDefinition.allowBroadPolicy.)
+   */
+  readonly allowBroadPolicy: boolean;
 }
 
-/** Response from `personas.compile`. */
+/**
+ * Slim list-row returned by `personas.list` (canonical scanner output).
+ *
+ * Promoted from a local definition in persona-service.ts (Phase 1a follow-up)
+ * so backend and frontend build against one declaration. `memory` is carried
+ * per row per the design (§5).
+ */
+export interface PersonaListDto {
+  readonly name: string;
+  readonly description: string;
+  readonly compiled: boolean;
+  /**
+   * Whether persistent memory is enabled for this persona
+   * (persona.memory?.enabled ?? true). NOTE: the Phase-1a service does not yet
+   * populate this; it is part of the locked contract and is filled in when the
+   * scanner is extended. Additive and backward-compatible.
+   */
+  readonly memory?: boolean;
+}
+
+/** Result of editing a persona's constitution (`personas.editConstitution`). */
+export interface PersonaEditResultDto {
+  /** True when the compiled policy no longer matches the new constitution. */
+  readonly stale: boolean;
+}
+
+/**
+ * Compile-time diff vs the persona's previous `compiled-policy.json`,
+ * carried on a successful compile result (Phase 1c). Surfaced by the
+ * `done` event/card so prompt-injected broadening is reviewable after the
+ * fact. `broadenedDomains` / `outOfWorkspacePaths` enumerate the specific
+ * `'*'`-domain and out-of-workspace `paths.within` values introduced (these
+ * are only ever non-empty for an `allowBroadPolicy` persona, since otherwise
+ * the broad-policy validator would have rejected the compile).
+ */
+export interface RuleDeltaDto {
+  readonly added: number;
+  readonly loosened: number;
+  readonly removed: number;
+  readonly broadenedDomains: readonly string[];
+  readonly outOfWorkspacePaths: readonly string[];
+}
+
+/**
+ * Success-only compile result carried by a `done` operation record / event.
+ *
+ * A terminal `done` record never represents failure — failures route through
+ * the `persona.compile.failed` event and `PersonaCompileOperationDto.error`.
+ * Phase 1c adds the optional `ruleDelta` (absent when there was no previous
+ * compiled policy to diff against).
+ */
 export interface PersonaCompileResultDto {
-  readonly success: boolean;
+  readonly success: true;
   readonly ruleCount: number;
-  readonly errors?: readonly string[];
+  readonly ruleDelta?: RuleDeltaDto;
+}
+
+/**
+ * Snapshot of a streamed persona-compile operation, returned by
+ * `personas.getCompile` and inside `personas.listCompiles`.
+ *
+ * Two distinct phase vocabularies:
+ *  - `phase` is the OPERATION lifecycle (started/running/done/failed).
+ *  - `serverProgress.compilationPhase` is the 9-value {@link CompilationPhase}
+ *    from the pipeline (type-only import) for the server currently compiling.
+ *
+ * The active operation record is the source of truth (events are best-effort /
+ * lossy), so a reconnecting client renders the live phase from a single
+ * `personas.listCompiles` call.
+ */
+export interface PersonaCompileOperationDto {
+  readonly operationId: string;
+  readonly name: string;
+  readonly phase: 'started' | 'running' | 'done' | 'failed';
+  readonly serverProgress?: {
+    readonly server: string;
+    readonly compilationPhase: CompilationPhase;
+    readonly detail?: string;
+  };
+  readonly queuePosition?: number;
+  readonly startedAt: string;
+  readonly endedAt?: string;
+  readonly result?: PersonaCompileResultDto;
+  readonly error?: { readonly code: ErrorCode; readonly message: string };
+  readonly actor: string;
+}
+
+/** Response from `personas.listCompiles`. */
+export interface PersonaListCompilesDto {
+  readonly active: readonly PersonaCompileOperationDto[];
+  readonly recent: readonly PersonaCompileOperationDto[];
+  readonly queueDepth: number;
+}
+
+/** Response from `personas.compileStream` (fire-and-return; jobs.run shape). */
+export interface PersonaCompileStreamAckDto {
+  readonly accepted: true;
+  readonly name: string;
+  readonly operationId: string;
+  /** True when the operation was enqueued behind the global concurrency gate. */
+  readonly queued?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -315,13 +315,121 @@ const CANNED_JOBS = [
   },
 ];
 
-const CANNED_PERSONAS = [
+interface MockPersonaListItem {
+  name: string;
+  description: string;
+  compiled: boolean;
+  memory?: boolean;
+}
+
+let CANNED_PERSONAS: MockPersonaListItem[] = [
   { name: 'default', description: 'General-purpose assistant with standard policy', compiled: true },
   { name: 'researcher', description: 'Read-only access focused on code analysis', compiled: true },
   { name: 'devops', description: 'Infrastructure and deployment operations', compiled: false },
+  // Sentinel persona whose compileStream preflight reports CREDENTIALS_MISSING,
+  // so the e2e suite can render the typed credentials affordance.
+  { name: 'no-creds', description: 'Persona missing model credentials (test sentinel)', compiled: false },
+  // Sentinel persona whose compile never reaches a terminal phase, so it stays
+  // in `active` -- used to test reconnect rehydration of an in-flight card.
+  { name: 'slow-compile', description: 'Persona with a never-finishing compile (test sentinel)', compiled: false },
+  // Sentinel persona whose compile starts then emits persona.compile.failed,
+  // so the e2e suite can render the post-start failure affordance.
+  { name: 'fail-compile', description: 'Persona whose compile fails after starting (test sentinel)', compiled: false },
 ];
 
-const CANNED_PERSONA_DETAILS: Record<string, unknown> = {
+// ---------------------------------------------------------------------------
+// Persona streamed-compile state (Phase 1b)
+//
+// Mirrors the daemon's persona-compile-orchestrator: an `active` map of live
+// operations and a bounded `recent` map of terminal records, both keyed by
+// operationId. compileStream broadcasts started -> progress(x2) -> done and
+// writes the terminal record into `recent` at/just-before `done` so a
+// post-completion getCompile and a reconnect-time listCompiles both return a
+// real record.
+// ---------------------------------------------------------------------------
+
+type MockCompilationPhase =
+  | 'cached'
+  | 'compiling'
+  | 'lists'
+  | 'scenarios'
+  | 'repair-scenarios'
+  | 'verifying'
+  | 'repair-compile'
+  | 'repair-verify'
+  | 'done';
+
+interface MockRuleDelta {
+  added: number;
+  loosened: number;
+  removed: number;
+  broadenedDomains: string[];
+  outOfWorkspacePaths: string[];
+}
+
+interface MockCompileOperation {
+  operationId: string;
+  name: string;
+  phase: 'started' | 'running' | 'done' | 'failed';
+  serverProgress?: { server: string; compilationPhase: MockCompilationPhase; detail?: string };
+  queuePosition?: number;
+  startedAt: string;
+  endedAt?: string;
+  result?: { success: true; ruleCount: number; ruleDelta?: MockRuleDelta };
+  error?: { code: string; message: string };
+  actor: string;
+}
+
+const activeCompiles = new Map<string, MockCompileOperation>();
+const recentCompiles = new Map<string, MockCompileOperation>();
+const RECENT_COMPILES_CAP = 50;
+let compileOpSeq = 0;
+const compileTimers: ReturnType<typeof setTimeout>[] = [];
+
+// Default-true in the mock so the e2e happy-path works (a flag-OFF override is
+// a 1c concern). Drives the POLICY_MUTATION_FORBIDDEN gate on compileStream.
+let allowPolicyMutation = true;
+
+function mintOperationId(): string {
+  return `mock-op-${Date.now()}-${++compileOpSeq}`;
+}
+
+function recordRecentCompile(op: MockCompileOperation): void {
+  recentCompiles.set(op.operationId, op);
+  // Bounded LRU: drop oldest insertion-order entries when over cap.
+  while (recentCompiles.size > RECENT_COMPILES_CAP) {
+    const oldest = recentCompiles.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    recentCompiles.delete(oldest);
+  }
+}
+
+function clearCompileState(): void {
+  for (const t of compileTimers) clearTimeout(t);
+  compileTimers.length = 0;
+  activeCompiles.clear();
+  recentCompiles.clear();
+  compileOpSeq = 0;
+  allowPolicyMutation = true;
+  // Full restore of the persona list + details mutated by simulateCompile and
+  // the Phase 1c CRUD handlers (create/delete/edit/memory/broad-policy).
+  CANNED_PERSONAS = structuredClone(ORIGINAL_PERSONAS_LIST);
+  CANNED_PERSONA_DETAILS = structuredClone(ORIGINAL_PERSONA_DETAILS_FULL);
+}
+
+interface MockPersonaDetail {
+  name: string;
+  description: string;
+  createdAt: string;
+  constitution: string;
+  servers?: string[];
+  hasPolicy: boolean;
+  policyRuleCount?: number;
+  memory: boolean;
+  allowBroadPolicy: boolean;
+}
+
+let CANNED_PERSONA_DETAILS: Record<string, MockPersonaDetail> = {
   default: {
     name: 'default',
     description: 'General-purpose assistant with standard policy',
@@ -331,6 +439,8 @@ const CANNED_PERSONA_DETAILS: Record<string, unknown> = {
     servers: ['filesystem', 'git'],
     hasPolicy: true,
     policyRuleCount: 12,
+    memory: true,
+    allowBroadPolicy: false,
   },
   researcher: {
     name: 'researcher',
@@ -341,6 +451,8 @@ const CANNED_PERSONA_DETAILS: Record<string, unknown> = {
     servers: ['filesystem'],
     hasPolicy: true,
     policyRuleCount: 8,
+    memory: true,
+    allowBroadPolicy: false,
   },
   devops: {
     name: 'devops',
@@ -350,8 +462,45 @@ const CANNED_PERSONA_DETAILS: Record<string, unknown> = {
       '# DevOps Persona\n\n## Principles\n\n- Allow Docker operations\n- Allow deployment scripts\n- Escalate infrastructure changes\n',
     servers: ['filesystem', 'git', 'github'],
     hasPolicy: false,
+    memory: true,
+    allowBroadPolicy: false,
+  },
+  'no-creds': {
+    name: 'no-creds',
+    description: 'Persona missing model credentials (test sentinel)',
+    createdAt: new Date(Date.now() - 2 * 86400_000).toISOString(),
+    constitution: '# No-Creds Persona\n\n## Principles\n\n- Allow read operations\n',
+    servers: ['filesystem'],
+    hasPolicy: false,
+    memory: true,
+    allowBroadPolicy: false,
+  },
+  'slow-compile': {
+    name: 'slow-compile',
+    description: 'Persona with a never-finishing compile (test sentinel)',
+    createdAt: new Date(Date.now() - 1 * 86400_000).toISOString(),
+    constitution: '# Slow Compile Persona\n\n## Principles\n\n- Allow read operations\n',
+    servers: ['filesystem'],
+    hasPolicy: false,
+    memory: true,
+    allowBroadPolicy: false,
+  },
+  'fail-compile': {
+    name: 'fail-compile',
+    description: 'Persona whose compile fails after starting (test sentinel)',
+    createdAt: new Date(Date.now() - 1 * 86400_000).toISOString(),
+    constitution: '# Fail Compile Persona\n\n## Principles\n\n- Allow read operations\n',
+    servers: ['filesystem'],
+    hasPolicy: false,
+    memory: true,
+    allowBroadPolicy: false,
   },
 };
+
+// Deep snapshots of the original persona list + details so resetState can
+// restore them after create/delete/edit mutate the in-memory copies.
+const ORIGINAL_PERSONAS_LIST: MockPersonaListItem[] = structuredClone(CANNED_PERSONAS);
+const ORIGINAL_PERSONA_DETAILS_FULL: Record<string, MockPersonaDetail> = structuredClone(CANNED_PERSONA_DETAILS);
 
 const CANNED_FILE_TREE = {
   entries: [
@@ -906,7 +1055,7 @@ function buildMessageLogFixtures(workflowId: string): Array<Record<string, unkno
 const jobs = structuredClone(CANNED_JOBS);
 
 /** Reset all mutable state for test isolation. */
-function resetState(): void {
+function resetState(opts?: { allowPolicyMutation?: boolean }): void {
   sessions.clear();
   escalations.clear();
   nextLabel = 1;
@@ -914,6 +1063,12 @@ function resetState(): void {
   jobs.length = 0;
   jobs.push(...structuredClone(CANNED_JOBS));
   initWorkflows();
+  clearCompileState();
+  // clearCompileState resets allowPolicyMutation to true (the default); honor a
+  // per-test override AFTER it so a flag-OFF e2e (controls hidden) is real.
+  if (opts?.allowPolicyMutation !== undefined) {
+    allowPolicyMutation = opts.allowPolicyMutation;
+  }
   if (replayController) {
     replayController.abort();
     replayController = null;
@@ -981,6 +1136,10 @@ function buildStatusDto() {
     webUiListening: true,
     activeSessions: sessions.size,
     nextFireTime: jobs[0]?.nextRun ?? null,
+    // Phase 1c: drives whether the UI shows persona-mutation controls. Default
+    // true so the e2e happy paths work; a per-test POST /__reset override can
+    // flip it OFF to exercise the controls-hidden path.
+    allowPolicyMutation,
   };
 }
 
@@ -1071,6 +1230,96 @@ async function simulateTurn(ws: WebSocket, label: number, text: string): Promise
   emit(ws, 'session.output', { label, text: response, turnNumber });
   emit(ws, 'session.budget_update', { label, budget: buildBudgetDto(session) });
   emit(ws, 'session.updated', buildSessionDto(session));
+}
+
+// ---------------------------------------------------------------------------
+// Simulated streamed persona compile
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive a streamed compile: started -> progress(x2 canned phases) -> done.
+ * The terminal record is written into `recentCompiles` and removed from
+ * `activeCompiles` at/just-before the `done` broadcast, so a getCompile or a
+ * reconnect-time listCompiles issued after completion still returns it.
+ */
+function simulateCompile(op: MockCompileOperation): void {
+  // started
+  op.phase = 'started';
+  broadcast('persona.compile.started', { name: op.name, operationId: op.operationId, actor: op.actor });
+
+  // progress #1
+  compileTimers.push(
+    setTimeout(() => {
+      const live = activeCompiles.get(op.operationId);
+      if (!live) return;
+      live.phase = 'running';
+      live.serverProgress = { server: 'filesystem', compilationPhase: 'scenarios', detail: 'generating scenarios' };
+      broadcast('persona.compile.progress', {
+        name: live.name,
+        operationId: live.operationId,
+        serverName: 'filesystem',
+        phase: 'scenarios',
+        detail: 'generating scenarios',
+      });
+    }, 200),
+  );
+
+  // progress #2
+  compileTimers.push(
+    setTimeout(() => {
+      const live = activeCompiles.get(op.operationId);
+      if (!live) return;
+      live.serverProgress = { server: 'git', compilationPhase: 'verifying' };
+      broadcast('persona.compile.progress', {
+        name: live.name,
+        operationId: live.operationId,
+        serverName: 'git',
+        phase: 'verifying',
+      });
+    }, 400),
+  );
+
+  // done -- move active -> recent, then broadcast.
+  compileTimers.push(
+    setTimeout(() => {
+      const live = activeCompiles.get(op.operationId);
+      if (!live) return;
+      const ruleCount = 10 + Math.floor(Math.random() * 10);
+      live.phase = 'done';
+      live.endedAt = new Date().toISOString();
+      const pd = CANNED_PERSONA_DETAILS[live.name];
+      // ruleDelta is present only when a previous compiled policy existed (i.e.
+      // this is a recompile); absent on a first compile.
+      const hadPriorPolicy = pd?.hasPolicy === true;
+      const ruleDelta: MockRuleDelta | undefined = hadPriorPolicy
+        ? {
+            added: 2,
+            loosened: 1,
+            removed: 0,
+            broadenedDomains: [],
+            outOfWorkspacePaths: [],
+          }
+        : undefined;
+      live.result = { success: true, ruleCount, ...(ruleDelta ? { ruleDelta } : {}) };
+      // Critical-section analogue: record into recent, drop from active BEFORE
+      // emitting done, so a getCompile/listCompiles issued immediately after the
+      // event sees a real terminal record.
+      activeCompiles.delete(op.operationId);
+      recordRecentCompile(live);
+      // Flip the persona's compiled flag so the list badge updates on refresh.
+      const persona = CANNED_PERSONAS.find((p) => p.name === live.name);
+      if (persona) persona.compiled = true;
+      if (pd) {
+        pd.hasPolicy = true;
+        pd.policyRuleCount = ruleCount;
+      }
+      broadcast('persona.compile.done', {
+        name: live.name,
+        operationId: live.operationId,
+        result: { success: true, ruleCount, ...(ruleDelta ? { ruleDelta } : {}) },
+      });
+    }, 600),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,11 +1487,197 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       return pDetail;
     }
 
-    case 'personas.compile': {
+    case 'personas.compileStream': {
       const pName = params.name as string;
+      if (typeof pName !== 'string' || pName.length === 0) {
+        return errorResult('INVALID_PARAMS', 'name is required');
+      }
+      // Security gate (1b): default-allow in the mock; flag-OFF is a 1c concern.
+      if (!allowPolicyMutation) {
+        return errorResult('POLICY_MUTATION_FORBIDDEN', 'Policy mutation is not permitted on this daemon');
+      }
       if (!CANNED_PERSONA_DETAILS[pName]) return errorResult('PERSONA_NOT_FOUND', `Persona "${pName}" not found`);
-      // Simulate compilation success
-      return { success: true, ruleCount: 10 + Math.floor(Math.random() * 10) };
+      // Simulate the credentials-missing preflight for a sentinel persona name so
+      // the e2e suite can render the typed affordance without flipping the flag.
+      if (pName === 'no-creds') {
+        return errorResult('CREDENTIALS_MISSING', 'Required model credentials are missing');
+      }
+      // Reject a second concurrent compile for the same persona.
+      for (const op of activeCompiles.values()) {
+        if (op.name === pName) {
+          return errorResult('COMPILE_IN_PROGRESS', `A compile is already running for "${pName}"`);
+        }
+      }
+      const operationId = mintOperationId();
+      const op: MockCompileOperation = {
+        operationId,
+        name: pName,
+        phase: 'started',
+        startedAt: new Date().toISOString(),
+        actor: 'web:mock',
+      };
+      activeCompiles.set(operationId, op);
+      // The `slow-compile` sentinel emits started + one progress event but never
+      // reaches a terminal phase, so it stays in `active` -- letting the e2e
+      // suite reconnect and verify the in-flight card rehydrates via listCompiles.
+      if (pName === 'slow-compile') {
+        broadcast('persona.compile.started', { name: op.name, operationId, actor: op.actor });
+        compileTimers.push(
+          setTimeout(() => {
+            const live = activeCompiles.get(operationId);
+            if (!live) return;
+            live.phase = 'running';
+            live.serverProgress = {
+              server: 'filesystem',
+              compilationPhase: 'scenarios',
+              detail: 'generating scenarios',
+            };
+            broadcast('persona.compile.progress', {
+              name: live.name,
+              operationId,
+              serverName: 'filesystem',
+              phase: 'scenarios',
+              detail: 'generating scenarios',
+            });
+          }, 150),
+        );
+      } else if (pName === 'fail-compile') {
+        broadcast('persona.compile.started', { name: op.name, operationId, actor: op.actor });
+        compileTimers.push(
+          setTimeout(() => {
+            const live = activeCompiles.get(operationId);
+            if (!live) return;
+            live.phase = 'failed';
+            live.endedAt = new Date().toISOString();
+            live.error = { code: 'COMPILE_FAILED', message: 'Scenario verification did not converge' };
+            activeCompiles.delete(operationId);
+            recordRecentCompile(live);
+            broadcast('persona.compile.failed', {
+              name: live.name,
+              operationId,
+              code: 'COMPILE_FAILED',
+              error: 'Scenario verification did not converge',
+            });
+          }, 300),
+        );
+      } else {
+        simulateCompile(op);
+      }
+      return { accepted: true, name: pName, operationId };
+    }
+
+    case 'personas.getCompile': {
+      const operationId = params.operationId as string;
+      if (typeof operationId !== 'string' || operationId.length === 0) {
+        return errorResult('INVALID_PARAMS', 'operationId is required');
+      }
+      const op = activeCompiles.get(operationId) ?? recentCompiles.get(operationId);
+      if (!op) return errorResult('COMPILE_NOT_FOUND', `Compile operation ${operationId} not found`);
+      return op;
+    }
+
+    case 'personas.listCompiles': {
+      return {
+        active: [...activeCompiles.values()],
+        recent: [...recentCompiles.values()],
+        queueDepth: 0,
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1c persona CRUD. All gated on allowPolicyMutation; the gate fires
+    // BEFORE any other validation (mirrors requirePolicyMutation in the daemon).
+    // Each mutation broadcasts personas.changed.
+    // -----------------------------------------------------------------------
+
+    case 'personas.create': {
+      const gate = requireMutation();
+      if (gate) return gate;
+      const cName = params.name as string;
+      const cDesc = params.description as string;
+      if (typeof cName !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(cName) || cName.length > 63) {
+        return errorResult('INVALID_PARAMS', `Invalid persona name: ${cName}`);
+      }
+      if (typeof cDesc !== 'string' || cDesc.trim().length === 0) {
+        return errorResult('INVALID_PARAMS', 'description is required');
+      }
+      if (CANNED_PERSONA_DETAILS[cName]) {
+        return errorResult('PERSONA_EXISTS', `Persona "${cName}" already exists`);
+      }
+      const cServers = Array.isArray(params.servers) ? (params.servers as string[]) : undefined;
+      const cMemory = params.memoryEnabled === undefined ? true : params.memoryEnabled === true;
+      const cConstitution = typeof params.constitution === 'string' ? params.constitution : '';
+      const newDetail: MockPersonaDetail = {
+        name: cName,
+        description: cDesc.trim(),
+        createdAt: new Date().toISOString(),
+        constitution: cConstitution,
+        ...(cServers && cServers.length > 0 ? { servers: cServers } : {}),
+        hasPolicy: false,
+        memory: cMemory,
+        allowBroadPolicy: false,
+      };
+      CANNED_PERSONA_DETAILS[cName] = newDetail;
+      CANNED_PERSONAS.push({ name: cName, description: cDesc.trim(), compiled: false, memory: cMemory });
+      broadcast('personas.changed', {});
+      return newDetail;
+    }
+
+    case 'personas.editConstitution': {
+      const gate = requireMutation();
+      if (gate) return gate;
+      const eName = params.name as string;
+      const eConstitution = params.constitution as string;
+      const ed = CANNED_PERSONA_DETAILS[eName];
+      if (!ed) return errorResult('PERSONA_NOT_FOUND', `Persona "${eName}" not found`);
+      ed.constitution = typeof eConstitution === 'string' ? eConstitution : '';
+      broadcast('personas.changed', {});
+      // stale is true iff the persona had a compiled policy that no longer
+      // matches the (now-changed) constitution.
+      return { stale: ed.hasPolicy };
+    }
+
+    case 'personas.setMemory': {
+      const gate = requireMutation();
+      if (gate) return gate;
+      const mName = params.name as string;
+      const md = CANNED_PERSONA_DETAILS[mName];
+      if (!md) return errorResult('PERSONA_NOT_FOUND', `Persona "${mName}" not found`);
+      md.memory = params.enabled === true;
+      const listItem = CANNED_PERSONAS.find((p) => p.name === mName);
+      if (listItem) listItem.memory = md.memory;
+      broadcast('personas.changed', {});
+      return md;
+    }
+
+    case 'personas.setBroadPolicyOptIn': {
+      const gate = requireMutation();
+      if (gate) return gate;
+      const bName = params.name as string;
+      const bd = CANNED_PERSONA_DETAILS[bName];
+      if (!bd) return errorResult('PERSONA_NOT_FOUND', `Persona "${bName}" not found`);
+      bd.allowBroadPolicy = params.enabled === true;
+      broadcast('personas.changed', {});
+      return bd;
+    }
+
+    case 'personas.delete': {
+      const gate = requireMutation();
+      if (gate) return gate;
+      const dName = params.name as string;
+      if (params.confirmed !== true) {
+        return errorResult('INVALID_PARAMS', 'confirmed must be true');
+      }
+      if (!CANNED_PERSONA_DETAILS[dName]) {
+        return errorResult('PERSONA_NOT_FOUND', `Persona "${dName}" not found`);
+      }
+      // Soft (default) and hard (force) both remove the persona from the listed
+      // set in the mock; the real daemon distinguishes trash vs rmSync but the
+      // observable effect over the wire (gone from list) is the same.
+      delete CANNED_PERSONA_DETAILS[dName];
+      CANNED_PERSONAS = CANNED_PERSONAS.filter((p) => p.name !== dName);
+      broadcast('personas.changed', {});
+      return { deleted: true };
     }
 
     // Workflow methods
@@ -1557,6 +1992,19 @@ function errorResult(code: string, message: string): RpcErrorResult {
   return { __rpcError: true, code, message };
 }
 
+/**
+ * Kill-switch gate shared by all Phase 1c persona-mutation methods. Returns an
+ * RpcError when the mock's `allowPolicyMutation` flag is OFF (set via the
+ * POST /__reset override), else undefined. Mirrors requirePolicyMutation in the
+ * daemon dispatch: the gate fires BEFORE any other validation.
+ */
+function requireMutation(): RpcErrorResult | undefined {
+  if (!allowPolicyMutation) {
+    return errorResult('POLICY_MUTATION_FORBIDDEN', 'Policy mutation is not enabled on this daemon');
+  }
+  return undefined;
+}
+
 function isRpcError(value: unknown): value is RpcErrorResult {
   return typeof value === 'object' && value !== null && '__rpcError' in value;
 }
@@ -1660,9 +2108,23 @@ wss.on('connection', (ws) => {
 const RESET_PORT = parseInt(process.env.RESET_PORT ?? '7401', 10);
 const httpServer = createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/__reset') {
-    resetState();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      let opts: { allowPolicyMutation?: boolean } | undefined;
+      if (body.trim().length > 0) {
+        try {
+          opts = JSON.parse(body) as { allowPolicyMutation?: boolean };
+        } catch {
+          opts = undefined;
+        }
+      }
+      resetState(opts);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
   } else if (req.method === 'POST' && req.url === '/__workflow-event') {
     let body = '';
     req.on('data', (chunk: Buffer) => {

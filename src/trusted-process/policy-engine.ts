@@ -43,6 +43,7 @@ import {
   extractDomainForRole,
 } from './domain-utils.js';
 import { getListMatcher } from './list-matcher.js';
+import * as logger from '../logger.js';
 
 /**
  * Extracts string values from arguments based on annotation roles.
@@ -237,10 +238,20 @@ function ruleRelevantToRole(rule: CompiledRule, role: ArgumentRole): boolean {
 function getEffectiveListValues(listName: string, lists: DynamicListsFile): string[] {
   const list = lists.lists[listName] as ResolvedList | undefined;
   if (!list) {
-    throw new Error(
-      `Dynamic list "@${listName}" referenced in policy but not found in dynamic-lists.json. ` +
-        `Run "ironcurtain compile-policy" to resolve lists.`,
+    // Fail CLOSED, not loud: a `@list` referenced by the compiled policy but
+    // absent from dynamic-lists.json expands to the empty allowlist (=> deny),
+    // rather than throwing. Throwing here would crash policy load — notably the
+    // accepted "old compiled policy + newly-written lists" interleaving during a
+    // concurrent persona recompile (lists.json is written before compiled-policy.json),
+    // where a renamed list id would otherwise abort the whole load. An empty
+    // allowlist denies the affected rule, which is the safe degradation. The warn
+    // (fired once per policy load, not per evaluation) preserves observability for
+    // a genuine "forgot to compile lists" misconfiguration.
+    logger.warn(
+      `[policy] Dynamic list "@${listName}" referenced in policy but not in dynamic-lists.json; ` +
+        `treating as empty (deny). Run "ironcurtain compile-policy" to resolve lists.`,
     );
+    return [];
   }
 
   const removals = new Set(list.manualRemovals);

@@ -16,7 +16,10 @@ import type {
   BudgetSummaryDto,
   PersonaListItem,
   PersonaDetailDto,
-  PersonaCompileResultDto,
+  PersonaEditResultDto,
+  PersonaCompileOperationDto,
+  PersonaCompileStreamAckDto,
+  PersonaListCompilesDto,
   ResumableWorkflowDto,
   WorkflowSummaryDto,
   WorkflowDetailDto,
@@ -75,6 +78,12 @@ class AppState {
   workflows: Map<string, WorkflowSummaryDto> = $state(new Map());
   selectedWorkflowId: string | null = $state(null);
   pendingGates: Map<string, HumanGateRequestDto> = $state(new Map());
+
+  // Persona streamed-compile state, keyed by operationId. Holds both live
+  // (started/running) and recently-terminal (done/failed) operations as they
+  // arrive via persona.compile.* events, hydrated on (re)connect via
+  // personas.listCompiles.
+  personaCompiles: Map<string, PersonaCompileOperationDto> = $state(new Map());
 
   get selectedSession(): SessionDto | null {
     if (this.selectedSessionLabel === null) return null;
@@ -140,6 +149,17 @@ export const appState = new AppState();
  */
 export const connectionGeneration = $state({ value: 0 });
 
+/**
+ * Monotonically increasing counter bumped on every `personas.changed`
+ * server-push event (persona create/edit/delete/memory/broad-policy mutation).
+ * The Personas view reads `.value` as a $effect dependency to refresh its
+ * locally-held persona list + selected detail, mirroring how `job.list_changed`
+ * drives `refreshJobs`. Kept as a standalone reactive object (rather than on
+ * appState) because the persona list lives in the route component, not the
+ * global store.
+ */
+export const personasChangedGeneration = $state({ value: 0 });
+
 // WebSocket client singleton
 let wsClient: WsClient | null = null;
 
@@ -193,6 +213,9 @@ function wireEventHandlers(client: WsClient): void {
       appState,
       {
         refreshJobs: () => refreshJobs(client),
+        refreshPersonas: () => {
+          personasChangedGeneration.value++;
+        },
         assignDisplayNumber: (_escalationId: string) => ++appState.escalationDisplayNumber,
       },
       event,
@@ -212,12 +235,15 @@ let isInitialConnect = true;
 
 async function refreshAll(client: WsClient): Promise<void> {
   try {
-    const [status, sessions, jobs, escalations, workflowsList] = await Promise.all([
+    const [status, sessions, jobs, escalations, workflowsList, personaCompiles] = await Promise.all([
       client.request<DaemonStatusDto>('status'),
       client.request<SessionDto[]>('sessions.list'),
       client.request<JobListDto[]>('jobs.list'),
       client.request<EscalationDto[]>('escalations.list'),
       client.request<WorkflowSummaryDto[]>('workflows.list').catch(() => [] as WorkflowSummaryDto[]),
+      client
+        .request<PersonaListCompilesDto>('personas.listCompiles', {})
+        .catch(() => ({ active: [], recent: [], queueDepth: 0 }) as PersonaListCompilesDto),
     ]);
 
     appState.daemonStatus = status;
@@ -235,6 +261,12 @@ async function refreshAll(client: WsClient): Promise<void> {
       newWorkflows.set(wf.workflowId, wf);
     }
     appState.workflows = newWorkflows;
+
+    // Rehydrate persona compile operations (active wins over recent on id collision).
+    const newPersonaCompiles = new Map<string, PersonaCompileOperationDto>();
+    for (const op of personaCompiles.recent) newPersonaCompiles.set(op.operationId, op);
+    for (const op of personaCompiles.active) newPersonaCompiles.set(op.operationId, op);
+    appState.personaCompiles = newPersonaCompiles;
 
     // Repopulate pending gates for any workflow stuck at a human gate.
     // Events may have been lost during disconnect, leaving pendingGates empty.
@@ -417,6 +449,75 @@ export async function listPersonas(): Promise<PersonaListItem[]> {
   return getWsClient().request<PersonaListItem[]>('personas.list');
 }
 
+// ── Persona CRUD mutation RPC actions (Phase 1c) ──────────────────────
+//
+// All five are gated server-side on the daemon's `--allow-policy-mutation`
+// flag: when off they reject with POLICY_MUTATION_FORBIDDEN. The UI hides
+// these controls when `appState.daemonStatus.allowPolicyMutation` is false,
+// so a forbidden rejection is a defense-in-depth path, not the normal one.
+// Errors (RpcError with a `.code`) bubble to the caller for inline/actionable
+// affordances. Each successful mutation also triggers a `personas.changed`
+// server-push event handled by the event handler.
+
+/**
+ * Create a new persona. `servers: undefined` (or omitted) means "all servers
+ * (incl. future)"; a non-empty array narrows to those servers explicitly.
+ * Errors: INVALID_PARAMS (bad slug / empty description), PERSONA_EXISTS,
+ * POLICY_MUTATION_FORBIDDEN.
+ */
+export async function createPersona(input: {
+  name: string;
+  description: string;
+  servers?: string[];
+  memoryEnabled?: boolean;
+  constitution?: string;
+}): Promise<PersonaDetailDto> {
+  const params: Record<string, unknown> = {
+    name: input.name,
+    description: input.description,
+  };
+  if (input.servers !== undefined) params.servers = input.servers;
+  if (input.memoryEnabled !== undefined) params.memoryEnabled = input.memoryEnabled;
+  if (input.constitution !== undefined) params.constitution = input.constitution;
+  return getWsClient().request<PersonaDetailDto>('personas.create', params);
+}
+
+/**
+ * Replace a persona's constitution. Returns `{ stale }` — `stale: true` means
+ * the previously compiled policy no longer matches the constitution and should
+ * be recompiled. Errors: PERSONA_NOT_FOUND, POLICY_MUTATION_FORBIDDEN.
+ */
+export async function editPersonaConstitution(name: string, constitution: string): Promise<PersonaEditResultDto> {
+  return getWsClient().request<PersonaEditResultDto>('personas.editConstitution', { name, constitution });
+}
+
+/** Toggle a persona's persistent-memory flag. Errors: PERSONA_NOT_FOUND, POLICY_MUTATION_FORBIDDEN. */
+export async function setPersonaMemory(name: string, enabled: boolean): Promise<PersonaDetailDto> {
+  return getWsClient().request<PersonaDetailDto>('personas.setMemory', { name, enabled });
+}
+
+/**
+ * Set a persona's broad-policy opt-in. This is the ONLY way to set
+ * `allowBroadPolicy`; it is never inferred from the constitution. When enabled,
+ * the compiler's broad-policy validator permits wildcard domains/lists and
+ * out-of-workspace paths. Errors: PERSONA_NOT_FOUND, POLICY_MUTATION_FORBIDDEN.
+ */
+export async function setPersonaBroadPolicyOptIn(name: string, enabled: boolean): Promise<PersonaDetailDto> {
+  return getWsClient().request<PersonaDetailDto>('personas.setBroadPolicyOptIn', { name, enabled });
+}
+
+/**
+ * Delete a persona. Soft by default (renamed into a trash dir, policy left
+ * inert); `force: true` hard-deletes and revokes the policy. `confirmed: true`
+ * is required by the backend schema. Errors: PERSONA_NOT_FOUND,
+ * POLICY_MUTATION_FORBIDDEN.
+ */
+export async function deletePersona(name: string, opts?: { force?: boolean }): Promise<{ deleted: true }> {
+  const params: Record<string, unknown> = { name, confirmed: true };
+  if (opts?.force) params.force = true;
+  return getWsClient().request<{ deleted: true }>('personas.delete', params);
+}
+
 // ── Workflow RPC actions ────────────────────────────────────────────
 
 export async function listWorkflowDefinitions(): Promise<WorkflowDefinitionDto[]> {
@@ -527,8 +628,40 @@ export async function getPersonaDetail(name: string): Promise<PersonaDetailDto> 
   return getWsClient().request<PersonaDetailDto>('personas.get', { name });
 }
 
-export async function compilePersonaPolicy(name: string): Promise<PersonaCompileResultDto> {
-  return getWsClient().request<PersonaCompileResultDto>('personas.compile', { name });
+/**
+ * Fire-and-return a streamed persona compile. The ack carries the minted
+ * operationId; subsequent progress arrives via persona.compile.* events that
+ * land in `appState.personaCompiles`. RPC errors (e.g. POLICY_MUTATION_FORBIDDEN,
+ * COMPILE_IN_PROGRESS, CREDENTIALS_MISSING) bubble to the caller.
+ */
+export async function startPersonaCompile(name: string): Promise<PersonaCompileStreamAckDto> {
+  return getWsClient().request<PersonaCompileStreamAckDto>('personas.compileStream', { name });
+}
+
+/** Read a single compile operation snapshot (active live record, else recent LRU). */
+export async function getPersonaCompile(operationId: string): Promise<PersonaCompileOperationDto> {
+  return getWsClient().request<PersonaCompileOperationDto>('personas.getCompile', { operationId });
+}
+
+/** List in-flight + recently-terminal compile operations. */
+export async function listPersonaCompiles(): Promise<PersonaListCompilesDto> {
+  return getWsClient().request<PersonaListCompilesDto>('personas.listCompiles', {});
+}
+
+/**
+ * (Re)hydrate `appState.personaCompiles` from the daemon's authoritative
+ * active+recent records. Called on connect/reconnect and by the Personas view.
+ * Returns the operationIds present on the server so callers can detect a
+ * locally-tracked op that the server no longer knows about (interrupted).
+ */
+export async function hydratePersonaCompiles(): Promise<Set<string>> {
+  const { active, recent } = await listPersonaCompiles();
+  const next = new Map<string, PersonaCompileOperationDto>();
+  for (const op of recent) next.set(op.operationId, op);
+  // Active records win over a recent record with the same id.
+  for (const op of active) next.set(op.operationId, op);
+  appState.personaCompiles = next;
+  return new Set(next.keys());
 }
 
 export async function connectWithToken(token: string): Promise<void> {

@@ -17,6 +17,11 @@ import type {
   HumanGateRequestDto,
   LatestVerdictDto,
   LiveWorkflowPhase,
+  PersonaCompileOperationDto,
+  PersonaCompileStartedEvent,
+  PersonaCompileProgressEvent,
+  PersonaCompileDoneEvent,
+  PersonaCompileFailedEvent,
 } from './types.js';
 import { PHASE } from './types.js';
 
@@ -92,6 +97,8 @@ export interface AppStateLike {
   jobs: JobListDto[];
   workflows: Map<string, WorkflowSummaryDto>;
   pendingGates: Map<string, HumanGateRequestDto>;
+  /** Live + recently-terminal persona compile operations, keyed by operationId. */
+  personaCompiles: Map<string, PersonaCompileOperationDto>;
   addOutput(label: number, line: OutputLine): void;
   removeOutput(label: number): void;
   filterOutput(label: number, predicate: (line: OutputLine) => boolean): void;
@@ -100,6 +107,11 @@ export interface AppStateLike {
 /** Side effects that handleEvent may request. */
 export interface EventSideEffects {
   refreshJobs(): void;
+  /**
+   * Refresh the persona list (and any open persona detail). Invoked on every
+   * `personas.changed` event, mirroring `refreshJobs` for `job.list_changed`.
+   */
+  refreshPersonas(): void;
   assignDisplayNumber(escalationId: string): number;
 }
 
@@ -166,7 +178,12 @@ export type WebEvent =
   | { event: 'workflow.completed'; payload: { workflowId: string } }
   | { event: 'workflow.failed'; payload: { workflowId: string; error: string } }
   | { event: 'workflow.gate_raised'; payload: { workflowId: string; gate: HumanGateRequestDto } }
-  | { event: 'workflow.gate_dismissed'; payload: { workflowId: string; gateId: string } };
+  | { event: 'workflow.gate_dismissed'; payload: { workflowId: string; gateId: string } }
+  | { event: 'persona.compile.started'; payload: PersonaCompileStartedEvent }
+  | { event: 'persona.compile.progress'; payload: PersonaCompileProgressEvent }
+  | { event: 'persona.compile.done'; payload: PersonaCompileDoneEvent }
+  | { event: 'persona.compile.failed'; payload: PersonaCompileFailedEvent }
+  | { event: 'personas.changed'; payload: Record<string, never> };
 
 /**
  * Parse a raw event name + payload into a typed WebEvent.
@@ -237,6 +254,16 @@ export function parseEvent(event: string, payload: unknown): WebEvent | undefine
       };
     case 'workflow.gate_dismissed':
       return { event, payload: data as { workflowId: string; gateId: string } };
+    case 'persona.compile.started':
+      return { event, payload: data as unknown as PersonaCompileStartedEvent };
+    case 'persona.compile.progress':
+      return { event, payload: data as unknown as PersonaCompileProgressEvent };
+    case 'persona.compile.done':
+      return { event, payload: data as unknown as PersonaCompileDoneEvent };
+    case 'persona.compile.failed':
+      return { event, payload: data as unknown as PersonaCompileFailedEvent };
+    case 'personas.changed':
+      return { event, payload: {} as Record<string, never> };
     default:
       return undefined;
   }
@@ -256,6 +283,23 @@ export function handleEvent(state: AppStateLike, effects: EventSideEffects, even
  * Apply a typed WebEvent to the state. The switch on `parsed.event`
  * narrows `parsed.payload` automatically.
  */
+/**
+ * Returns the existing compile record, or a minimal synthesized "running"
+ * record that tolerates a `started` event lost during a disconnect.
+ */
+function compileBaseRecord(
+  existing: PersonaCompileOperationDto | undefined,
+  operationId: string,
+  name: string,
+): PersonaCompileOperationDto {
+  return existing ?? { operationId, name, phase: 'running', startedAt: new Date().toISOString(), actor: 'unknown' };
+}
+
+/** Immutably upserts a compile record (new Map so Svelte 5 detects the change). */
+function setCompileRecord(state: AppStateLike, operationId: string, record: PersonaCompileOperationDto): void {
+  state.personaCompiles = new Map(state.personaCompiles).set(operationId, record);
+}
+
 function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebEvent): boolean {
   switch (parsed.event) {
     case 'daemon.status':
@@ -476,6 +520,55 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
       }
       return true;
     }
+
+    // Persona streamed-compile events
+    case 'persona.compile.started': {
+      const { name, operationId, actor } = parsed.payload;
+      setCompileRecord(state, operationId, {
+        operationId,
+        name,
+        phase: 'started',
+        startedAt: new Date().toISOString(),
+        actor,
+      });
+      return true;
+    }
+
+    case 'persona.compile.progress': {
+      const { name, operationId, serverName, phase: compilationPhase, detail } = parsed.payload;
+      const base = compileBaseRecord(state.personaCompiles.get(operationId), operationId, name);
+      setCompileRecord(state, operationId, {
+        ...base,
+        phase: 'running',
+        serverProgress: { server: serverName, compilationPhase, ...(detail !== undefined ? { detail } : {}) },
+      });
+      return true;
+    }
+
+    case 'persona.compile.done': {
+      const { name, operationId, result } = parsed.payload;
+      const base = compileBaseRecord(state.personaCompiles.get(operationId), operationId, name);
+      setCompileRecord(state, operationId, { ...base, phase: 'done', endedAt: new Date().toISOString(), result });
+      return true;
+    }
+
+    case 'persona.compile.failed': {
+      const { name, operationId, code, error } = parsed.payload;
+      const base = compileBaseRecord(state.personaCompiles.get(operationId), operationId, name);
+      setCompileRecord(state, operationId, {
+        ...base,
+        phase: 'failed',
+        endedAt: new Date().toISOString(),
+        error: { code, message: error },
+      });
+      return true;
+    }
+
+    // Persona CRUD change notification (Phase 1c): refresh the persona list,
+    // mirroring how `job.list_changed` triggers `refreshJobs`.
+    case 'personas.changed':
+      effects.refreshPersonas();
+      return true;
 
     default:
       return false;

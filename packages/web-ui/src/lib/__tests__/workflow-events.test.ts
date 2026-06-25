@@ -16,6 +16,7 @@ function createMockState(): AppStateLike & { outputs: Map<number, OutputLine[]> 
     jobs: [],
     workflows: new Map(),
     pendingGates: new Map(),
+    personaCompiles: new Map(),
     outputs,
     addOutput(label: number, line: OutputLine) {
       let existing = outputs.get(label) ?? [];
@@ -38,6 +39,7 @@ function createMockState(): AppStateLike & { outputs: Map<number, OutputLine[]> 
 function createMockEffects(): EventSideEffects {
   return {
     refreshJobs: vi.fn(),
+    refreshPersonas: vi.fn(),
     assignDisplayNumber: vi.fn(() => 1),
   };
 }
