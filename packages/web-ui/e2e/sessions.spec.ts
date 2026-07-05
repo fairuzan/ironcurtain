@@ -1,5 +1,13 @@
 import { test, expect } from '@playwright/test';
-import { connectWithToken, navigateTo, createDefaultSession, sendMessage, resetMockServer } from './helpers.js';
+import {
+  connectWithToken,
+  navigateTo,
+  createDefaultSession,
+  resetMockServer,
+  ptyRows,
+  waitForPtyTerminal,
+  sendTrustedPtyPrompt,
+} from './helpers.js';
 
 test.describe('Sessions', () => {
   test.beforeEach(async ({ page, request }) => {
@@ -12,9 +20,21 @@ test.describe('Sessions', () => {
     await expect(page.getByText('No active sessions')).toBeVisible();
   });
 
-  test('creates a new session via New > Default', async ({ page }) => {
+  test('creates a new session via the explicit Start session action', async ({ page }) => {
     const label = await createDefaultSession(page);
     expect(label).toMatch(/#\d+/);
+  });
+
+  test('keeps workspace, provider, and persona launch options available before start', async ({ page }) => {
+    await navigateTo(page, 'Sessions');
+
+    await expect(page.getByText('Launch options')).toBeVisible();
+    await expect(page.getByTestId('launch-workspace')).toBeVisible();
+    await expect(page.getByTestId('launch-provider')).toBeVisible();
+    await expect(page.getByTestId('launch-persona')).toBeVisible();
+    await expect(page.getByTestId('launch-start')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'New' })).toHaveCount(0);
+    await expect(page.locator('[data-testid^="session-item-"]')).toHaveCount(0);
   });
 
   test('session appears in the sidebar after creation', async ({ page }) => {
@@ -24,48 +44,20 @@ test.describe('Sessions', () => {
     await expect(sidebar.locator('[data-testid^="session-item-"]').first()).toBeVisible();
   });
 
-  test('sends a message and receives assistant output', async ({ page }) => {
+  test('renders a PTY terminal after creation', async ({ page }) => {
     await createDefaultSession(page);
-    await sendMessage(page, 'Hello agent');
-
-    // User message should appear in the output
-    await expect(page.getByText('Hello agent')).toBeVisible();
-
-    // The mock server emits tool_call events after ~800ms, then output after ~2.6s
-    // Wait for the final assistant response (markdown rendered from CANNED_RESPONSES)
-    await expect(page.getByText('Analysis Complete').or(page.getByText("I've completed"))).toBeVisible({
-      timeout: 10_000,
-    });
+    await waitForPtyTerminal(page);
   });
 
-  test('shows collapsible tool call group', async ({ page }) => {
+  test('sends a trusted prompt and echoes it into the terminal', async ({ page }) => {
     await createDefaultSession(page);
-    await sendMessage(page, 'Run analysis');
+    await waitForPtyTerminal(page);
 
-    // Wait for tool calls to arrive and be grouped
-    // The collapsible group shows a summary like "2 tool calls"
-    await expect(page.locator('button', { hasText: /tool call/ })).toBeVisible({ timeout: 10_000 });
-  });
+    const message = 'session-helper-prompt-17';
+    await sendTrustedPtyPrompt(page, message);
 
-  test('auto-scrolls output container on new messages', async ({ page }) => {
-    await createDefaultSession(page);
-    await sendMessage(page, 'First message');
-
-    // Wait for the response to fully render
-    await expect(page.getByText('Analysis Complete').or(page.getByText("I've completed"))).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Wait for auto-scroll to settle: scrollTop should be near scrollHeight
-    await page.waitForFunction(
-      () => {
-        const container = document.querySelector('[data-testid="session-output"]');
-        if (!container) return false;
-        const { scrollTop, scrollHeight, clientHeight } = container;
-        return scrollHeight - scrollTop - clientHeight < 50;
-      },
-      { timeout: 5_000 },
-    );
+    await expect(ptyRows(page)).toContainText(message, { timeout: 15_000 });
+    await expect(page.getByTestId('pty-prompt-input')).toHaveValue('');
   });
 
   test('ends a session and removes it from sidebar', async ({ page }) => {
