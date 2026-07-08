@@ -370,6 +370,8 @@ describe('OpenRouter OFF — native profile is byte-identical to today', () => {
       // Forces subagents synchronous (issue #367); set on every path — native
       // and OpenRouter — not an OpenRouter-specific var.
       CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+      // Disables the streaming idle watchdog (issue #367); set on every path.
+      CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
       IRONCURTAIN_API_KEY: 'sk-ant-api03-ironcurtain-FAKE',
     });
     // No OpenRouter vars leaked in.
