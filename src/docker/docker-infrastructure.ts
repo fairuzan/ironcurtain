@@ -48,12 +48,22 @@ import type { ProviderKeyMapping } from './mitm-proxy.js';
 import { parseUpstreamBaseUrl, type AgentKind, type ProviderConfig, type UpstreamTarget } from './provider-config.js';
 import { getInternalNetworkName } from './platform.js';
 import { cleanupContainers } from './container-lifecycle.js';
+import {
+  createIronCurtainInternalNetwork,
+  InternalNetworkConnectivityError,
+  managedResourceLabels,
+  reconcileIronCurtainDockerResourcesBestEffort,
+  releaseManagedResourceLease,
+  withInternalNetworkAllocationRetry,
+} from './docker-resource-lifecycle.js';
 import { clampDockerResources } from './resource-limits.js';
 import { errorMessage } from '../utils/error-message.js';
 import { createCachedStager } from '../skills/staging.js';
 import type { ResolvedSkill } from '../skills/types.js';
 import { withProvisionLock } from './provision-lock.js';
 import * as logger from '../logger.js';
+
+export { InternalNetworkConnectivityError };
 
 /**
  * Create a bundle-owned directory and enforce 0o700 permissions even if
@@ -949,6 +959,7 @@ export async function destroyDockerInfrastructure(infra: DockerInfrastructure): 
     sidecarContainerId: infra.sidecarContainerId ?? null,
     networkName: infra.internalNetwork ?? null,
   });
+  if (infra.runtimeKind === 'docker') releaseManagedResourceLease(infra.bundleId);
 
   // Proxies are independent producers -- stop them in parallel. Each
   // per-promise catch logs so one failure doesn't mask the other, and
@@ -1009,11 +1020,18 @@ export async function destroyDockerInfrastructure(infra: DockerInfrastructure): 
  *
  * See `docs/designs/workflow-session-identity.md` §7.
  */
-export function buildBundleLabels(core: Pick<PreContainerInfrastructure, 'bundleId' | 'workflowId' | 'scope'>): {
+export function buildBundleLabels(
+  core: Pick<PreContainerInfrastructure, 'bundleId' | 'workflowId' | 'scope' | 'runtimeKind'>,
+): {
   bundleLabel: string;
   workflowLabel?: string;
   scopeLabel?: string;
+  labels?: Readonly<Record<string, string>>;
 } {
+  const managedLabels = core.runtimeKind === 'docker' ? managedResourceLabels(core.bundleId) : undefined;
+  const labels = managedLabels
+    ? Object.fromEntries(Object.entries(managedLabels).filter(([key]) => key !== 'ironcurtain.bundle'))
+    : undefined;
   if (core.workflowId !== undefined) {
     return {
       bundleLabel: core.bundleId,
@@ -1022,9 +1040,10 @@ export function buildBundleLabels(core: Pick<PreContainerInfrastructure, 'bundle
       // bundle; default-fall back to DEFAULT_CONTAINER_SCOPE so that a
       // workflow bundle always carries a scope label.
       scopeLabel: core.scope ?? DEFAULT_CONTAINER_SCOPE,
+      labels,
     };
   }
-  return { bundleLabel: core.bundleId };
+  return { bundleLabel: core.bundleId, labels };
 }
 
 /**
@@ -1125,6 +1144,28 @@ export async function createSessionContainers(
   config: IronCurtainConfig,
   options?: CreateDockerInfrastructureOptions,
 ): Promise<ContainerResources> {
+  if (core.runtimeKind === 'docker') {
+    await reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'session startup');
+  }
+
+  const maxAttempts = core.topology === 'tcp-sidecar' ? 4 : 1;
+  return withInternalNetworkAllocationRetry(
+    {
+      maxAttempts,
+      description: 'Internal Docker network',
+      reconcile: () => reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'internal network retry'),
+    },
+    (excludedSubnets, attempt) => createSessionContainersAttempt(core, config, options, excludedSubnets, attempt),
+  );
+}
+
+async function createSessionContainersAttempt(
+  core: PreContainerInfrastructure,
+  config: IronCurtainConfig,
+  options: CreateDockerInfrastructureOptions | undefined,
+  excludedSubnets: ReadonlySet<string>,
+  attempt: number,
+): Promise<ContainerResources> {
   const shortId = getBundleShortId(core.bundleId);
   const mainContainerName = `${CONTAINER_NAME_PREFIX}${shortId}`;
   // Labels applied to every IronCurtain-owned container (main + sidecar).
@@ -1142,6 +1183,7 @@ export async function createSessionContainers(
   let mainContainerId: string | undefined;
   let sidecarContainerId: string | undefined;
   let internalNetwork: string | undefined;
+  let allocatedNetworkSubnet: string | undefined;
 
   try {
     const mainImage =
@@ -1209,10 +1251,15 @@ export async function createSessionContainers(
       mounts.push({ source: aptProxyPath, target: '/etc/apt/apt.conf.d/90-ironcurtain-proxy', readonly: true });
 
       // Create a per-session --internal Docker network that blocks internet egress.
-      const networkName = getInternalNetworkName(shortId);
-      await core.docker.createNetwork(networkName, { internal: true });
+      const baseNetworkName = getInternalNetworkName(shortId);
+      const networkName = attempt === 1 ? baseNetworkName : `${baseNetworkName}-a${attempt}`;
+      const allocatedNetwork = await createIronCurtainInternalNetwork(core.docker, networkName, core.bundleId, {
+        excludedSubnets,
+      });
+      allocatedNetworkSubnet = allocatedNetwork.subnet;
       internalNetwork = networkName;
       network = networkName;
+      logger.info(`Allocated internal Docker network ${networkName} at ${allocatedNetwork.subnet}`);
 
       // Ensure the socat image is available
       const socatImage = 'alpine/socat';
@@ -1391,7 +1438,17 @@ export async function createSessionContainers(
     if (core.topology === 'tcp-hostonly' && core.hostOnlyNetwork !== undefined && core.proxy.port !== undefined) {
       await checkHostOnlyConnectivity(core.docker, mainContainerId, core.hostOnlyNetwork.gateway, core.proxy.port);
     } else if (core.useTcp && internalNetwork !== undefined && core.proxy.port !== undefined) {
-      await checkInternalNetworkConnectivity(core.docker, mainContainerId, core.proxy.port);
+      if (core.mitmAddr.port === undefined) {
+        throw new Error('tcp-sidecar bundle is missing its MITM proxy port');
+      }
+      try {
+        await checkInternalNetworkConnectivity(core.docker, mainContainerId, core.proxy.port, core.mitmAddr.port);
+      } catch (error) {
+        if (error instanceof InternalNetworkConnectivityError) {
+          throw new InternalNetworkConnectivityError(error.message, allocatedNetworkSubnet);
+        }
+        throw error;
+      }
     }
 
     return {
@@ -1410,6 +1467,7 @@ export async function createSessionContainers(
       sidecarContainerId: sidecarContainerId ?? null,
       networkName: internalNetwork ?? null,
     });
+    if (core.runtimeKind === 'docker') releaseManagedResourceLease(core.bundleId);
     throw err;
   }
 }
@@ -1418,23 +1476,45 @@ export async function createSessionContainers(
  * Probes whether the container can reach host-side proxies via the socat
  * sidecar on the internal Docker network. Throws a descriptive error if not.
  */
-async function checkInternalNetworkConnectivity(
+export async function checkInternalNetworkConnectivity(
   docker: ContainerRuntime,
   containerId: string,
   mcpPort: number,
+  mitmPort: number,
 ): Promise<void> {
-  const result = await docker.exec(
+  const mcpResult = await docker.exec(
     containerId,
-    ['socat', '-u', '/dev/null', `TCP:${DOCKER_HOST_GATEWAY}:${mcpPort},connect-timeout=5`],
+    [
+      '/bin/sh',
+      '-c',
+      `printf 'IRONCURTAIN_HEALTH/1\\n' | socat -T5 - TCP:${DOCKER_HOST_GATEWAY}:${mcpPort},connect-timeout=5 | grep -q '^IRONCURTAIN_OK/1'`,
+    ],
     // Allow a small buffer above socat's 5s connect-timeout for docker exec/process startup overhead.
     6_000,
   );
+  if (mcpResult.exitCode !== 0) {
+    throw new InternalNetworkConnectivityError(
+      `Internal network connectivity check failed: MCP round-trip exited ${mcpResult.exitCode}; ` +
+        `the sidecar could not reach the host proxy.`,
+    );
+  }
 
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `Internal network connectivity check failed (exit=${result.exitCode}). ` +
-        `The container cannot reach host-side proxies via the socat sidecar on the --internal Docker network. ` +
-        `Check that the sidecar container is running and connected to the internal network.`,
+  const healthRequest =
+    'GET http://ironcurtain.invalid/__ironcurtain/health HTTP/1.1\\r\\n' +
+    'Host: ironcurtain.invalid\\r\\nConnection: close\\r\\n\\r\\n';
+  const mitmResult = await docker.exec(
+    containerId,
+    [
+      '/bin/sh',
+      '-c',
+      `printf '${healthRequest}' | socat -T5 - TCP:${DOCKER_HOST_GATEWAY}:${mitmPort},connect-timeout=5 | grep -q 'IRONCURTAIN_OK/1'`,
+    ],
+    6_000,
+  );
+  if (mitmResult.exitCode !== 0) {
+    throw new InternalNetworkConnectivityError(
+      `Internal network connectivity check failed: MITM round-trip exited ${mitmResult.exitCode}; ` +
+        `the sidecar could not reach the host proxy.`,
     );
   }
 }

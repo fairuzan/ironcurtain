@@ -11,7 +11,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import type { ContainerRuntime, DockerContainerConfig, DockerExecResult, DockerImageInfo } from './types.js';
+import type {
+  ContainerRuntime,
+  DockerContainerConfig,
+  DockerContainerInfo,
+  DockerExecResult,
+  DockerImageInfo,
+  DockerNetworkCreateOptions,
+  DockerNetworkInfo,
+} from './types.js';
 import * as logger from '../logger.js';
 import { checkDockerAvailable, type DockerAvailability } from './docker-probe.js';
 import { isExecError, isExecTimeout } from '../utils/exec-error.js';
@@ -66,8 +74,44 @@ export const IRONCURTAIN_LABEL_BUNDLE = 'ironcurtain.bundle';
 export const IRONCURTAIN_LABEL_WORKFLOW = 'ironcurtain.workflow';
 export const IRONCURTAIN_LABEL_SCOPE = 'ironcurtain.scope';
 
+function stringRecord(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function inspectDockerObjects(
+  exec: ExecFileFn,
+  kind: 'network' | 'container',
+  ids: readonly string[],
+): Promise<readonly Record<string, unknown>[]> {
+  if (ids.length === 0) return [];
+  try {
+    const { stdout } = await exec('docker', [kind, 'inspect', ...ids], {
+      timeout: 30_000,
+      maxBuffer: 50 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(stdout) as unknown;
+    if (!Array.isArray(parsed)) throw new Error(`Unexpected docker ${kind} inspect result: expected array`);
+    return parsed.filter(isRecord);
+  } catch (error) {
+    const disappeared = isExecError(error) && /not found|no such (?:network|container|object)/i.test(error.stderr);
+    if (!disappeared) throw error;
+    if (ids.length === 1) return [];
+
+    // A resource disappeared between `docker ... ls` and inspect. Split the
+    // failed batch to retain every object that still exists without masking
+    // unrelated daemon/permission failures.
+    const middle = Math.ceil(ids.length / 2);
+    const left = await inspectDockerObjects(exec, kind, ids.slice(0, middle));
+    const right = await inspectDockerObjects(exec, kind, ids.slice(middle));
+    return [...left, ...right];
+  }
 }
 
 function parseDockerImageInfo(raw: unknown): DockerImageInfo {
@@ -229,6 +273,9 @@ export function buildCreateArgs(config: DockerContainerConfig): string[] {
   }
   if (config.scopeLabel !== undefined) {
     args.push('--label', `${IRONCURTAIN_LABEL_SCOPE}=${config.scopeLabel}`);
+  }
+  for (const [key, value] of Object.entries(config.labels ?? {})) {
+    args.push('--label', `${key}=${value}`);
   }
 
   if (config.resources?.memoryMb) {
@@ -635,21 +682,77 @@ export function createDockerManager(
       }
     },
 
-    async createNetwork(
-      name: string,
-      options?: { internal?: boolean; subnet?: string; gateway?: string },
-    ): Promise<void> {
+    async createNetwork(name: string, options?: DockerNetworkCreateOptions): Promise<void> {
       try {
         const args = ['network', 'create'];
         if (options?.internal) args.push('--internal');
         if (options?.subnet) args.push('--subnet', options.subnet);
         if (options?.gateway) args.push('--gateway', options.gateway);
+        for (const [key, value] of Object.entries(options?.labels ?? {})) {
+          args.push('--label', `${key}=${value}`);
+        }
         args.push(name);
         await exec('docker', args, { timeout: 10_000 });
       } catch (err: unknown) {
         if (isExecError(err) && err.stderr.includes('already exists')) return;
         throw err;
       }
+    },
+
+    async listNetworks(): Promise<readonly DockerNetworkInfo[]> {
+      const { stdout: idsOut } = await exec('docker', ['network', 'ls', '--no-trunc', '--quiet'], {
+        timeout: 10_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const ids = idsOut
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (ids.length === 0) return [];
+      const inspected = await inspectDockerObjects(exec, 'network', ids);
+      return inspected.map((entry): DockerNetworkInfo => {
+        const ipam = isRecord(entry.IPAM) && Array.isArray(entry.IPAM.Config) ? entry.IPAM.Config : [];
+        const subnets = ipam
+          .filter(isRecord)
+          .map((config) => config.Subnet)
+          .filter((subnet): subnet is string => typeof subnet === 'string');
+        const containers = isRecord(entry.Containers) ? entry.Containers : {};
+        return {
+          id: typeof entry.Id === 'string' ? entry.Id : '',
+          name: typeof entry.Name === 'string' ? entry.Name : '',
+          created: typeof entry.Created === 'string' ? entry.Created : '',
+          labels: stringRecord(entry.Labels),
+          subnets,
+          containerIds: Object.keys(containers),
+        };
+      });
+    },
+
+    async listContainers(options?: { readonly labelFilter?: string }): Promise<readonly DockerContainerInfo[]> {
+      const args = ['container', 'ls', '--all', '--no-trunc', '--quiet'];
+      if (options?.labelFilter) args.push('--filter', `label=${options.labelFilter}`);
+      const { stdout: idsOut } = await exec('docker', args, {
+        timeout: 10_000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const ids = idsOut
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (ids.length === 0) return [];
+      const inspected = await inspectDockerObjects(exec, 'container', ids);
+      return inspected.map((entry): DockerContainerInfo => {
+        const config = isRecord(entry.Config) ? entry.Config : {};
+        const state = isRecord(entry.State) ? entry.State : {};
+        const rawName = typeof entry.Name === 'string' ? entry.Name : '';
+        return {
+          id: typeof entry.Id === 'string' ? entry.Id : '',
+          name: rawName.startsWith('/') ? rawName.slice(1) : rawName,
+          created: typeof entry.Created === 'string' ? entry.Created : '',
+          running: state.Running === true,
+          labels: stringRecord(config.Labels),
+        };
+      });
     },
 
     async removeNetwork(name: string): Promise<void> {
@@ -664,6 +767,15 @@ export function createDockerManager(
         if (isExecError(err) && /not found|no such network/i.test(err.stderr)) return;
         const detail = isExecError(err) ? err.stderr.trim() || err.message : String(err);
         logger.warn(`removeNetwork: failed to remove "${name}": ${detail}`);
+      }
+    },
+
+    async networkExists(name: string): Promise<boolean> {
+      try {
+        await exec('docker', ['network', 'inspect', name], { timeout: 5_000 });
+        return true;
+      } catch {
+        return false;
       }
     },
 
