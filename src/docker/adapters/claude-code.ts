@@ -291,6 +291,15 @@ exit $STATUS
         // restores the pre-2.1.198 synchronous behavior, which the FSM's
         // one-turn=one-result model requires. See docs/en/env-vars.
         CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+        // Disable the streaming idle watchdog (on by default since Claude
+        // Code v2.1.196). Behind the MITM proxy, long tool-use turns and
+        // SSE re-buffering trip the watchdog's idle threshold, which
+        // aborts the request with "API Error: Response stalled
+        // mid-stream" — the actual root cause of issue #367 (PR #372's
+        // background-task fix alone did not resolve it). Turning the
+        // watchdog off restores the pre-2.1.196 behavior; the workflow
+        // orchestrator already enforces its own wall-clock/step budgets.
+        CLAUDE_ENABLE_STREAM_WATCHDOG: '0',
       };
 
       if (modelId) {
