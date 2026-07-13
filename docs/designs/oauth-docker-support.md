@@ -86,9 +86,12 @@ function detectAuthMethod(config: IronCurtainConfig): AuthMethod;
 
 **Detection order (prefer OAuth):**
 1. Read `~/.claude/.credentials.json` → parse `claudeAiOauth` → if valid and not expired, return `oauth`
-2. On macOS, if credentials file is missing, try extracting from Keychain (see 4.5)
-3. Fall back to `ANTHROPIC_API_KEY` / `config.userConfig.anthropicApiKey` → return `apikey`
-4. Return `none`
+2. Read `~/.config/anthropic/credentials/default.json` (Anthropic CLI store; honors `ANTHROPIC_CONFIG_DIR` and `XDG_CONFIG_HOME`) → parse flat snake_case shape (`access_token`, `refresh_token`, `expires_at` in epoch seconds) → if valid and not expired, return `oauth`
+3. On macOS, if no credentials file is found, try extracting from Keychain (see 4.5)
+4. Fall back to `ANTHROPIC_API_KEY` / `config.userConfig.anthropicApiKey` → return `apikey`
+5. Return `none`
+
+Token refresh writes back to the file the credentials were detected in, preserving that file's native format — the `AuthMethod` file variant carries a `filePath` for this.
 
 **Override:** `IRONCURTAIN_DOCKER_AUTH=apikey` forces API key mode.
 

@@ -541,6 +541,13 @@ export async function prepareDockerInfrastructure(
   // Providers sharing the same fakeKeyPrefix (and thus the same real credential)
   // reuse the same fake key so a single container token authenticates against all hosts.
   const oauthAccessToken = authMethod.kind === 'oauth' ? authMethod.credentials.accessToken : undefined;
+  // Re-reads and refresh write-backs must target the file the credentials
+  // were detected in — writing a rotated refresh token to the wrong file
+  // would strand the host's Claude Code login with an invalidated token.
+  const tokenManagerFileDeps =
+    authMethod.kind === 'oauth' && authMethod.source === 'file' && authMethod.filePath
+      ? { credentialsFilePath: authMethod.filePath }
+      : undefined;
   const tokenManagerKeychainDeps =
     authMethod.kind === 'oauth' && authMethod.source === 'keychain'
       ? { writeToKeychain, keychainServiceName: authMethod.keychainServiceName }
@@ -560,6 +567,7 @@ export async function prepareDockerInfrastructure(
           authMethod.credentials,
           { canRefresh: canRefreshOAuth(authMethod.credentials.refreshToken) },
           {
+            ...tokenManagerFileDeps,
             ...tokenManagerKeychainDeps,
             ...tokenManagerCodexDeps,
           },

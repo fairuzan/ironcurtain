@@ -753,6 +753,7 @@ describe('checkOAuthRefresh', () => {
   const oauthAuth = {
     kind: 'oauth' as const,
     source: 'file' as const,
+    filePath: '/home/user/.claude/.credentials.json',
     credentials: { accessToken: 'old', refreshToken: 'rt-old', expiresAt: Date.now() + 60_000 },
   };
   const freshCreds = { accessToken: 'new', refreshToken: 'rt-new', expiresAt: Date.now() + 3_600_000 };
@@ -773,7 +774,7 @@ describe('checkOAuthRefresh', () => {
     const r = await checkOAuthRefresh(baseConfig);
     expect(r.status).toBe('ok');
     expect(r.message).toMatch(/valid \(.*, file\)/);
-    expect(saveOAuthCredentials).toHaveBeenCalledWith(freshCreds);
+    expect(saveOAuthCredentials).toHaveBeenCalledWith(freshCreds, oauthAuth.filePath);
   });
 
   it('reports HTTP rejection with the status code and a re-login hint', async () => {

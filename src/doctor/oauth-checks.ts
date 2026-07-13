@@ -169,7 +169,7 @@ function formatRefreshFailure(result: Exclude<RefreshResult, { kind: 'ok' }>, el
  */
 function persistRefreshedOAuth(auth: Extract<AuthMethod, { kind: 'oauth' }>, credentials: OAuthCredentials): void {
   if (auth.source === 'file') {
-    saveOAuthCredentials(credentials);
+    saveOAuthCredentials(credentials, auth.filePath);
   } else {
     writeToKeychain(credentials, auth.keychainServiceName);
   }
