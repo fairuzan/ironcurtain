@@ -8,6 +8,7 @@
 IronCurtain's Docker agent mode currently only supports API key authentication. Most Claude Code users authenticate via OAuth (Pro/Max/Teams/Enterprise subscriptions), not API keys. These users cannot use Docker agent mode today.
 
 We need to:
+
 1. Detect whether the host user has OAuth credentials
 2. Prefer OAuth over API keys when both are available
 3. Maintain the security invariant: real credentials never enter the container
@@ -17,12 +18,14 @@ We need to:
 Claude Code natively supports a `CLAUDE_CODE_OAUTH_TOKEN` environment variable as its **highest-priority** auth source. When set, Claude Code uses it as a bearer token directly — no credentials files needed.
 
 **Auth priority order in Claude Code:**
+
 1. `CLAUDE_CODE_OAUTH_TOKEN` env var (highest)
 2. `ANTHROPIC_API_KEY` env var
 3. `~/.claude/.credentials.json` file
 4. macOS Keychain
 
 Users can generate a long-lived OAuth token (~1 year validity) via:
+
 ```bash
 claude setup-token
 ```
@@ -85,19 +88,23 @@ function detectAuthMethod(config: IronCurtainConfig): AuthMethod;
 ```
 
 **Detection order (prefer OAuth):**
+
 1. Read `~/.claude/.credentials.json` → parse `claudeAiOauth` → if valid and not expired, return `oauth`
 2. Read `~/.config/anthropic/credentials/default.json` (Anthropic CLI store; honors `ANTHROPIC_CONFIG_DIR` and `XDG_CONFIG_HOME`) → parse flat snake_case shape (`access_token`, `refresh_token`, `expires_at` in epoch seconds) → if valid and not expired, return `oauth`
 3. On macOS, if no credentials file is found, try extracting from Keychain (see 4.5)
 4. Fall back to `ANTHROPIC_API_KEY` / `config.userConfig.anthropicApiKey` → return `apikey`
 5. Return `none`
 
-Token refresh writes back to the file the credentials were detected in, preserving that file's native format — the `AuthMethod` file variant carries a `filePath` for this.
+Each credential file is considered independently: an expired file whose refresh fails does **not** shadow a valid (or refreshable) lower-priority file — detection falls through to the next candidate.
+
+Token refresh writes back to the file the credentials were detected in, preserving that file's native format — the `AuthMethod` file variant carries a `filePath` for this. If the origin file vanished between detection and write-back, the format is decided by the target path (CLI store path → flat snake_case) so the wrong shape is never written into the Anthropic CLI's store.
 
 **Override:** `IRONCURTAIN_DOCKER_AUTH=apikey` forces API key mode.
 
 ### 4.2 OAuth credential structure on host
 
 **Linux** — `~/.claude/.credentials.json` (mode 0600):
+
 ```json
 {
   "claudeAiOauth": {
@@ -112,11 +119,13 @@ Token refresh writes back to the file the credentials were detected in, preservi
 ```
 
 **macOS** — stored in Keychain under:
+
 - Service: `"Claude Code-credentials"` (write path) / `"Claude Code"` (read path)
 - Account: `$USER`
 - Value: same JSON structure as above
 
 Extraction command:
+
 ```bash
 security find-generic-password -s "Claude Code-credentials" -w
 # or
@@ -205,10 +214,10 @@ function extractFromKeychain(): OAuthCredentials | null {
   // Try both service names (Claude Code has a known bug where write/read use different names)
   for (const service of ['Claude Code-credentials', 'Claude Code']) {
     try {
-      const result = execSync(
-        `security find-generic-password -s "${service}" -w`,
-        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-      );
+      const result = execSync(`security find-generic-password -s "${service}" -w`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
       const parsed = JSON.parse(result.trim());
       if (parsed.claudeAiOauth?.accessToken) {
         return parsed.claudeAiOauth;
@@ -222,6 +231,7 @@ function extractFromKeychain(): OAuthCredentials | null {
 ```
 
 **Keychain access caveats:**
+
 - Prompts the user for Keychain password if locked (acceptable UX for a one-time session start)
 - SSH sessions may need `security unlock-keychain` first
 - If Keychain access fails, fall back to API key with a helpful message
@@ -333,22 +343,23 @@ Refresh token rotation means concurrent refreshes (IronCurtain + host Claude Cod
 
 ## 6. Edge Cases
 
-| Scenario | Behavior |
-|---|---|
-| Expired access token, valid refresh token | Refresh at session start; proceed with new token |
-| Expired access + expired refresh token | Fall back to API key; if none, error with "run `claude login`" |
-| Both OAuth and API key available | OAuth wins; override with `IRONCURTAIN_DOCKER_AUTH=apikey` |
-| macOS Keychain locked | Prompt user for password; fall back to API key on failure |
-| `~/.claude/.credentials.json` missing (macOS) | Try Keychain extraction |
-| `~/.claude/.credentials.json` missing (Linux) | Fall back to API key |
+| Scenario                                      | Behavior                                                         |
+| --------------------------------------------- | ---------------------------------------------------------------- |
+| Expired access token, valid refresh token     | Refresh at session start; proceed with new token                 |
+| Expired access + expired refresh token        | Fall back to API key; if none, error with "run `claude login`"   |
+| Both OAuth and API key available              | OAuth wins; override with `IRONCURTAIN_DOCKER_AUTH=apikey`       |
+| macOS Keychain locked                         | Prompt user for password; fall back to API key on failure        |
+| `~/.claude/.credentials.json` missing (macOS) | Try Keychain extraction                                          |
+| `~/.claude/.credentials.json` missing (Linux) | Fall back to API key                                             |
 | Token expires mid-session (401 from upstream) | Session errors; user restarts (future: host-side refresh on 401) |
-| Corrupt credentials file | JSON parse error caught; fall back to API key |
+| Corrupt credentials file                      | JSON parse error caught; fall back to API key                    |
 
 ## 7. Implementation Plan
 
 ### Phase 1: OAuth credential detection and provider config
 
 **New file:** `src/docker/oauth-credentials.ts`
+
 - `loadOAuthCredentials(): OAuthCredentials | null` — reads `~/.claude/.credentials.json`
 - `extractFromKeychain(): OAuthCredentials | null` — macOS Keychain extraction
 - `detectAuthMethod(config: IronCurtainConfig): AuthMethod` — preference logic
@@ -356,6 +367,7 @@ Refresh token rotation means concurrent refreshes (IronCurtain + host Claude Cod
 - Types: `OAuthCredentials`, `AuthMethod`
 
 **Modified:** `src/docker/provider-config.ts`
+
 - Add `anthropicOAuthProvider` and `claudePlatformOAuthProvider`
 
 **New tests:** `test/oauth-credentials.test.ts`
@@ -363,27 +375,33 @@ Refresh token rotation means concurrent refreshes (IronCurtain + host Claude Cod
 ### Phase 2: Integration (adapter, infrastructure, entrypoint)
 
 **Modified:** `src/docker/docker-infrastructure.ts`
+
 - `prepareDockerInfrastructure()` calls `detectAuthMethod()` early
 - Uses OAuth providers when `kind === 'oauth'`; real key = `credentials.accessToken`
 - Stores auth kind on `DockerInfrastructure` for adapter to use
 
 **Modified:** `src/docker/adapters/claude-code.ts`
+
 - `getProviders()` accepts auth kind parameter
 - `buildEnv()` sets `CLAUDE_CODE_OAUTH_TOKEN` in OAuth mode, `IRONCURTAIN_API_KEY` in API key mode
 
 **Modified:** `docker/entrypoint-claude-code.sh`
+
 - Conditional `apiKeyHelper` (omitted in OAuth mode)
 
 **Modified:** `src/docker/agent-adapter.ts`
+
 - `getProviders()` signature gains optional `authKind` parameter
 
 ### Phase 3: Token refresh at session start
 
 **Added to:** `src/docker/oauth-credentials.ts`
+
 - `refreshOAuthToken(credentials: OAuthCredentials): Promise<OAuthCredentials | null>`
 - Writes new credentials back to `~/.claude/.credentials.json`
 
 **Modified:** `src/docker/docker-infrastructure.ts`
+
 - Refresh before generating fake key if token is expired
 
 ### Phase 4: UX polish
@@ -395,16 +413,16 @@ Refresh token rotation means concurrent refreshes (IronCurtain + host Claude Cod
 
 ## 8. Files Changed Summary
 
-| File | Change |
-|------|--------|
-| `src/docker/oauth-credentials.ts` | **New** — credential detection, Keychain extraction, refresh |
-| `src/docker/provider-config.ts` | Add `anthropicOAuthProvider`, `claudePlatformOAuthProvider` |
-| `src/docker/docker-infrastructure.ts` | Auth method detection, conditional provider selection |
-| `src/docker/adapters/claude-code.ts` | Auth-aware `buildEnv()` and `getProviders()` |
-| `src/docker/agent-adapter.ts` | Optional `authKind` on `getProviders()` |
-| `docker/entrypoint-claude-code.sh` | Conditional `apiKeyHelper` |
-| `src/config/types.ts` | Optional `dockerAuth` on config |
-| `test/oauth-credentials.test.ts` | **New** — unit tests |
+| File                                  | Change                                                       |
+| ------------------------------------- | ------------------------------------------------------------ |
+| `src/docker/oauth-credentials.ts`     | **New** — credential detection, Keychain extraction, refresh |
+| `src/docker/provider-config.ts`       | Add `anthropicOAuthProvider`, `claudePlatformOAuthProvider`  |
+| `src/docker/docker-infrastructure.ts` | Auth method detection, conditional provider selection        |
+| `src/docker/adapters/claude-code.ts`  | Auth-aware `buildEnv()` and `getProviders()`                 |
+| `src/docker/agent-adapter.ts`         | Optional `authKind` on `getProviders()`                      |
+| `docker/entrypoint-claude-code.sh`    | Conditional `apiKeyHelper`                                   |
+| `src/config/types.ts`                 | Optional `dockerAuth` on config                              |
+| `test/oauth-credentials.test.ts`      | **New** — unit tests                                         |
 
 ## 9. Security Considerations
 
