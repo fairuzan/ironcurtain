@@ -8,8 +8,9 @@
  *
  * Detection order (prefer OAuth):
  * 1. ~/.claude/.credentials.json (claudeAiOauth)
- * 2. macOS Keychain (if credentials file missing)
- * 3. Fall back to API key from config
+ * 2. ~/.config/anthropic/credentials/default.json (Anthropic CLI store)
+ * 3. macOS Keychain (if no credentials file found)
+ * 4. Fall back to API key from config
  */
 
 import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
@@ -43,7 +44,13 @@ export interface KeychainResult {
 
 /** Authentication method detected on the host. */
 export type AuthMethod =
-  | { readonly kind: 'oauth'; readonly credentials: OAuthCredentials; readonly source: 'file' }
+  | {
+      readonly kind: 'oauth';
+      readonly credentials: OAuthCredentials;
+      readonly source: 'file';
+      /** Which credentials file the tokens came from; refresh writes back here. */
+      readonly filePath?: string;
+    }
   | {
       readonly kind: 'oauth';
       readonly credentials: OAuthCredentials;
@@ -76,6 +83,27 @@ export function getCredentialsFilePath(): string {
   return resolve(homedir(), '.claude', '.credentials.json');
 }
 
+/**
+ * Returns the path to the Anthropic CLI credential store's default profile.
+ * Resolution: ANTHROPIC_CONFIG_DIR > $XDG_CONFIG_HOME/anthropic > ~/.config/anthropic.
+ */
+export function getAnthropicCredentialsFilePath(): string {
+  // Truthy checks (not ??): an empty env var must fall through to the next
+  // candidate rather than resolving to a cwd-relative path.
+  const configDir = process.env.ANTHROPIC_CONFIG_DIR
+    ? process.env.ANTHROPIC_CONFIG_DIR
+    : process.env.XDG_CONFIG_HOME
+      ? resolve(process.env.XDG_CONFIG_HOME, 'anthropic')
+      : resolve(homedir(), '.config', 'anthropic');
+  return resolve(configDir, 'credentials', 'default.json');
+}
+
+/** OAuth credentials together with the file they were loaded from. */
+export interface FileCredentialsResult {
+  readonly credentials: OAuthCredentials;
+  readonly filePath: string;
+}
+
 /** Returns Codex's auth cache path, honoring CODEX_HOME when set. */
 export function getCodexAuthFilePath(): string {
   return resolve(process.env.CODEX_HOME ?? resolve(homedir(), '.codex'), 'auth.json');
@@ -90,23 +118,52 @@ export function isTokenExpired(credentials: OAuthCredentials): boolean {
 }
 
 /**
- * Loads OAuth credentials from ~/.claude/.credentials.json.
- * Returns null if the file is missing, unreadable, or lacks valid credentials.
+ * Loads OAuth credentials from the first credential file that yields valid
+ * credentials, checking ~/.claude/.credentials.json before the Anthropic CLI
+ * store at ~/.config/anthropic/credentials/default.json.
+ * Returns null if no file contains valid credentials.
  */
 export function loadOAuthCredentials(): OAuthCredentials | null {
-  const credPath = getCredentialsFilePath();
-  return loadCredentialsFromFile(credPath);
+  return loadOAuthCredentialsWithSource()?.credentials ?? null;
 }
 
 /**
- * Parses credentials from a file path. Extracted for testability.
+ * Loads credentials from every known credential file, in detection-priority
+ * order (~/.claude/.credentials.json first, then the Anthropic CLI store).
+ * Expired entries are included — detectAuthMethod() decides per file whether
+ * to use, refresh, or skip them.
+ */
+export function loadAllOAuthCredentialFiles(): FileCredentialsResult[] {
+  const results: FileCredentialsResult[] = [];
+  for (const filePath of [getCredentialsFilePath(), getAnthropicCredentialsFilePath()]) {
+    const credentials = loadCredentialsFromFile(filePath);
+    if (credentials) results.push({ credentials, filePath });
+  }
+  return results;
+}
+
+/**
+ * Like loadOAuthCredentials(), but also reports which file the credentials
+ * came from so token refresh can write back to the same file. Prefers the
+ * first file with an unexpired token; an expired higher-priority file must
+ * not shadow a valid lower-priority one.
+ */
+export function loadOAuthCredentialsWithSource(): FileCredentialsResult | null {
+  const all = loadAllOAuthCredentialFiles();
+  return all.find((r) => !isTokenExpired(r.credentials)) ?? all.at(0) ?? null;
+}
+
+/**
+ * Parses credentials from a file path, accepting either Claude Code's
+ * claudeAiOauth shape or the Anthropic CLI's flat snake_case shape.
+ * Extracted for testability.
  */
 export function loadCredentialsFromFile(filePath: string): OAuthCredentials | null {
   if (!existsSync(filePath)) return null;
 
   try {
     const raw = readFileSync(filePath, 'utf-8');
-    return parseCredentialsJson(raw);
+    return parseCredentialsJson(raw) ?? parseAnthropicCredentialsJson(raw);
   } catch {
     logger.warn(`Failed to read OAuth credentials from ${filePath}`);
     return null;
@@ -148,6 +205,36 @@ export function parseCredentialsJson(json: string): OAuthCredentials | null {
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses the Anthropic CLI credential store shape
+ * (~/.config/anthropic/credentials/default.json): flat snake_case fields
+ * with `expires_at` in epoch seconds (normalized to milliseconds here).
+ * Returns null if parsing fails or required fields are missing.
+ */
+export function parseAnthropicCredentialsJson(json: string): OAuthCredentials | null {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (typeof parsed !== 'object' || parsed === null) return null;
+
+    const creds = parsed as Record<string, unknown>;
+    // The documented store schema (version, access_token, expires_at,
+    // refresh_token, scope) does not include `type`; observed files carry
+    // type: 'oauth_token'. Accept both, but reject explicit non-OAuth types.
+    if (creds.type !== undefined && creds.type !== 'oauth_token') return null;
+    if (!isNonEmptyString(creds.access_token)) return null;
+    if (!isNonEmptyString(creds.refresh_token)) return null;
+    if (!isPositiveFiniteNumber(creds.expires_at)) return null;
+
+    return {
+      accessToken: creds.access_token,
+      refreshToken: creds.refresh_token,
+      expiresAt: creds.expires_at * 1000,
     };
   } catch {
     return null;
@@ -427,8 +514,28 @@ function parseCodexTokenResponse(data: Record<string, unknown>, fallbackRefreshT
 }
 
 /**
- * Writes updated OAuth credentials back to ~/.claude/.credentials.json,
- * preserving other fields in the file (e.g., scopes, subscriptionType).
+ * Decides whether a credentials write should use the Anthropic CLI's flat
+ * snake_case shape. Content is authoritative: a top-level snake_case token
+ * (or explicit type: 'oauth_token') marks a CLI file, a claudeAiOauth object
+ * marks a Claude Code file. When the content is ambiguous — the origin file
+ * was deleted or emptied between detection and this write-back — fall back
+ * to the path: writing the claudeAiOauth wrapper into the CLI store's own
+ * location would leave the Anthropic CLI unable to read its credentials.
+ */
+function shouldWriteAnthropicCliFormat(credPath: string, existing: Record<string, unknown>): boolean {
+  if (existing.type === 'oauth_token' || isNonEmptyString(existing.access_token)) return true;
+  if (typeof existing.claudeAiOauth === 'object' && existing.claudeAiOauth !== null) return false;
+  return credPath === getAnthropicCredentialsFilePath();
+}
+
+/**
+ * Writes updated OAuth credentials back to a credentials file (default
+ * ~/.claude/.credentials.json), preserving other fields in the file
+ * (e.g., scopes, subscriptionType). The write matches the file's existing
+ * format: Anthropic CLI files keep their flat snake_case shape (with
+ * `expires_at` in epoch seconds); everything else gets the claudeAiOauth
+ * shape. For an empty or unreadable file the format falls back to the
+ * target path (CLI store path -> CLI shape).
  */
 export function saveOAuthCredentials(credentials: OAuthCredentials, filePath?: string): void {
   const credPath = filePath ?? getCredentialsFilePath();
@@ -436,23 +543,32 @@ export function saveOAuthCredentials(credentials: OAuthCredentials, filePath?: s
   let existing: Record<string, unknown> = {};
   try {
     if (existsSync(credPath)) {
-      existing = JSON.parse(readFileSync(credPath, 'utf-8')) as Record<string, unknown>;
+      const parsed: unknown = JSON.parse(readFileSync(credPath, 'utf-8'));
+      if (typeof parsed === 'object' && parsed !== null) {
+        existing = parsed as Record<string, unknown>;
+      }
     }
   } catch {
     // Start fresh if file is unreadable
   }
 
-  const existingOauth =
-    typeof existing.claudeAiOauth === 'object' && existing.claudeAiOauth !== null
-      ? (existing.claudeAiOauth as Record<string, unknown>)
-      : {};
+  if (shouldWriteAnthropicCliFormat(credPath, existing)) {
+    existing.access_token = credentials.accessToken;
+    existing.refresh_token = credentials.refreshToken;
+    existing.expires_at = Math.round(credentials.expiresAt / 1000);
+  } else {
+    const existingOauth =
+      typeof existing.claudeAiOauth === 'object' && existing.claudeAiOauth !== null
+        ? (existing.claudeAiOauth as Record<string, unknown>)
+        : {};
 
-  existing.claudeAiOauth = {
-    ...existingOauth,
-    accessToken: credentials.accessToken,
-    refreshToken: credentials.refreshToken,
-    expiresAt: credentials.expiresAt,
-  };
+    existing.claudeAiOauth = {
+      ...existingOauth,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      expiresAt: credentials.expiresAt,
+    };
+  }
 
   writeFileSync(credPath, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 });
   // chmod after write — writeFileSync's mode only applies when creating new files;
@@ -498,7 +614,14 @@ export interface CredentialSources {
   loadFromFile: () => OAuthCredentials | null;
   loadFromKeychain: () => OAuthCredentials | null;
   refreshToken?: (refreshToken: string) => Promise<OAuthCredentials | null>;
-  saveToFile?: (credentials: OAuthCredentials) => void;
+  saveToFile?: (credentials: OAuthCredentials, filePath?: string) => void;
+  /**
+   * Path-aware multi-file loader; preferred over loadFromFile when present.
+   * Returns every parseable credential file in detection-priority order so
+   * detection can fall through to the next file when one is expired and
+   * unrefreshable.
+   */
+  loadFromFilesWithSource?: () => FileCredentialsResult[];
   loadFromKeychainWithService?: () => KeychainResult | null;
   writeToKeychain?: (credentials: OAuthCredentials, serviceName: string) => void;
 }
@@ -508,6 +631,7 @@ const defaultSources: CredentialSources = {
   loadFromKeychain: extractFromKeychain,
   refreshToken: async (rt) => refreshResultToCreds(await refreshOAuthToken(rt)),
   saveToFile: saveOAuthCredentials,
+  loadFromFilesWithSource: loadAllOAuthCredentialFiles,
   loadFromKeychainWithService: extractFromKeychainWithService,
   writeToKeychain,
 };
@@ -525,6 +649,7 @@ export const preflightCredentialSources: CredentialSources = {
   loadFromKeychain: extractFromKeychain,
   refreshToken: async (rt) => refreshResultToCreds(await refreshOAuthToken(rt)),
   saveToFile: saveOAuthCredentials,
+  loadFromFilesWithSource: loadAllOAuthCredentialFiles,
   loadFromKeychainWithService: extractFromKeychainWithService,
   writeToKeychain,
 };
@@ -538,6 +663,7 @@ export const preflightCredentialSources: CredentialSources = {
 export const readOnlyCredentialSources: CredentialSources = {
   loadFromFile: loadOAuthCredentials,
   loadFromKeychain: extractFromKeychain,
+  loadFromFilesWithSource: loadAllOAuthCredentialFiles,
   loadFromKeychainWithService: extractFromKeychainWithService,
 };
 
@@ -548,7 +674,8 @@ export const readOnlyCredentialSources: CredentialSources = {
  *
  * Priority:
  * 1. IRONCURTAIN_DOCKER_AUTH=apikey env var forces API key mode
- * 2. OAuth credentials from ~/.claude/.credentials.json (valid or refreshable)
+ * 2. OAuth credentials from ~/.claude/.credentials.json or
+ *    ~/.config/anthropic/credentials/default.json (valid or refreshable)
  * 3. OAuth credentials from macOS Keychain (valid or refreshable)
  * 4. API key from config
  * 5. None
@@ -562,24 +689,26 @@ export async function detectAuthMethod(config: IronCurtainConfig, sources?: Cred
     return resolveApiKeyAuth(config);
   }
 
-  // Try OAuth from credentials file
-  const fileCreds = s.loadFromFile();
-  if (fileCreds) {
+  // Try OAuth from credentials files, in detection-priority order. Each file
+  // is considered independently: an expired, unrefreshable file must not
+  // shadow a valid (or refreshable) lower-priority file.
+  const fileResults = s.loadFromFilesWithSource ? s.loadFromFilesWithSource() : toFileResults(s.loadFromFile());
+  for (const { credentials: fileCreds, filePath } of fileResults) {
     if (!isTokenExpired(fileCreds)) {
-      logger.info('Detected OAuth credentials from ~/.claude/.credentials.json');
-      return { kind: 'oauth', credentials: fileCreds, source: 'file' };
+      logger.info(`Detected OAuth credentials from ${filePath ?? 'credentials file'}`);
+      return { kind: 'oauth', credentials: fileCreds, source: 'file', filePath };
     }
 
     // Attempt refresh if refresh function is available
     if (s.refreshToken) {
-      const refreshed = await tryRefreshFileCreds(fileCreds, s.refreshToken, s.saveToFile);
+      const refreshed = await tryRefreshFileCreds(fileCreds, s.refreshToken, s.saveToFile, filePath);
       if (refreshed) return refreshed;
     }
-    logger.warn('OAuth token from credentials file is expired');
+    logger.warn(`OAuth token from ${filePath ?? 'credentials file'} is expired`);
   }
 
-  // Try macOS Keychain if credentials file was not found
-  if (!fileCreds) {
+  // Try macOS Keychain if no credentials file was found
+  if (fileResults.length === 0) {
     const keychainResult = s.loadFromKeychainWithService?.() ?? toKeychainResult(s.loadFromKeychain());
     if (keychainResult) {
       if (!isTokenExpired(keychainResult.credentials)) {
@@ -614,24 +743,35 @@ function toKeychainResult(creds: OAuthCredentials | null): KeychainResult | null
 }
 
 /**
+ * Wraps a plain OAuthCredentials from loadFromFile() into the path-aware
+ * list shape. The path is unknown for legacy loaders, so refresh write-back
+ * falls to saveToFile's default path.
+ */
+function toFileResults(creds: OAuthCredentials | null): Array<{ credentials: OAuthCredentials; filePath?: string }> {
+  if (!creds) return [];
+  return [{ credentials: creds }];
+}
+
+/**
  * Attempts to refresh expired file-sourced credentials.
- * On success, saves to file and returns the oauth AuthMethod.
+ * On success, saves to the originating file and returns the oauth AuthMethod.
  */
 async function tryRefreshFileCreds(
   fileCreds: OAuthCredentials,
   doRefresh: (refreshToken: string) => Promise<OAuthCredentials | null>,
-  saveToFile?: (credentials: OAuthCredentials) => void,
+  saveToFile?: (credentials: OAuthCredentials, filePath?: string) => void,
+  filePath?: string,
 ): Promise<AuthMethod | null> {
   const refreshed = await doRefresh(fileCreds.refreshToken);
   if (!refreshed) return null;
 
   try {
-    saveToFile?.(refreshed);
+    saveToFile?.(refreshed, filePath);
   } catch (err) {
     logger.warn(`Failed to save refreshed credentials to file: ${err instanceof Error ? err.message : String(err)}`);
   }
   logger.info('Refreshed expired OAuth token from credentials file');
-  return { kind: 'oauth', credentials: refreshed, source: 'file' };
+  return { kind: 'oauth', credentials: refreshed, source: 'file', filePath };
 }
 
 /**

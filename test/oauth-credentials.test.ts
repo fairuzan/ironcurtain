@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { tmpdir, platform } from 'node:os';
+import { tmpdir, platform, homedir } from 'node:os';
 import type { IronCurtainConfig } from '../src/config/types.js';
 import {
   parseCredentialsJson,
+  parseAnthropicCredentialsJson,
+  getAnthropicCredentialsFilePath,
   parseCodexAuthJson,
   loadCodexOAuthCredentials,
   loadCredentialsFromFile,
@@ -30,6 +32,17 @@ const VALID_CREDENTIALS = {
     scopes: ['user:inference', 'user:profile'],
     subscriptionType: 'max',
   },
+};
+
+// Valid Anthropic CLI credential store fixture (~/.config/anthropic/credentials/default.json)
+const VALID_ANTHROPIC_CLI_CREDENTIALS = {
+  version: '1.0',
+  type: 'oauth_token',
+  access_token: 'sk-ant-oat01-cli-access-token',
+  expires_at: Math.floor((Date.now() + 3_600_000) / 1000),
+  refresh_token: 'sk-ant-ort01-cli-refresh-token',
+  scope: 'user:developer user:inference user:profile',
+  organization_uuid: 'org-uuid-1234',
 };
 
 function makeConfig(overrides?: Partial<IronCurtainConfig['userConfig']>): IronCurtainConfig {
@@ -199,6 +212,82 @@ describe('parseCredentialsJson', () => {
   });
 });
 
+// --- parseAnthropicCredentialsJson ---
+
+describe('parseAnthropicCredentialsJson', () => {
+  it('parses Anthropic CLI credentials and converts expires_at to milliseconds', () => {
+    const result = parseAnthropicCredentialsJson(JSON.stringify(VALID_ANTHROPIC_CLI_CREDENTIALS));
+    expect(result).not.toBeNull();
+    expect(result!.accessToken).toBe('sk-ant-oat01-cli-access-token');
+    expect(result!.refreshToken).toBe('sk-ant-ort01-cli-refresh-token');
+    expect(result!.expiresAt).toBe(VALID_ANTHROPIC_CLI_CREDENTIALS.expires_at * 1000);
+  });
+
+  it('returns null when type is present but not oauth_token', () => {
+    const creds = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, type: 'api_key' };
+    expect(parseAnthropicCredentialsJson(JSON.stringify(creds))).toBeNull();
+  });
+
+  it('accepts credentials without a type field (documented store schema)', () => {
+    // The WIF reference documents {version, access_token, expires_at,
+    // refresh_token, scope} without a type discriminator.
+    const noType = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, type: undefined };
+    const result = parseAnthropicCredentialsJson(JSON.stringify(noType));
+    expect(result).not.toBeNull();
+    expect(result!.accessToken).toBe('sk-ant-oat01-cli-access-token');
+  });
+
+  it('returns null when required fields are missing or invalid', () => {
+    // JSON.stringify drops keys whose value is undefined
+    const noAccess = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, access_token: undefined };
+    const noRefresh = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, refresh_token: undefined };
+    expect(parseAnthropicCredentialsJson(JSON.stringify(noAccess))).toBeNull();
+    expect(parseAnthropicCredentialsJson(JSON.stringify(noRefresh))).toBeNull();
+    expect(
+      parseAnthropicCredentialsJson(JSON.stringify({ ...VALID_ANTHROPIC_CLI_CREDENTIALS, expires_at: 'soon' })),
+    ).toBeNull();
+    expect(parseAnthropicCredentialsJson('not json')).toBeNull();
+    expect(parseAnthropicCredentialsJson('null')).toBeNull();
+  });
+});
+
+// --- getAnthropicCredentialsFilePath ---
+
+describe('getAnthropicCredentialsFilePath', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('defaults to ~/.config/anthropic/credentials/default.json', () => {
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', '');
+    delete process.env.ANTHROPIC_CONFIG_DIR;
+    vi.stubEnv('XDG_CONFIG_HOME', '');
+    delete process.env.XDG_CONFIG_HOME;
+    expect(getAnthropicCredentialsFilePath()).toBe(
+      resolve(homedir(), '.config', 'anthropic', 'credentials', 'default.json'),
+    );
+  });
+
+  it('honors XDG_CONFIG_HOME', () => {
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', '');
+    delete process.env.ANTHROPIC_CONFIG_DIR;
+    vi.stubEnv('XDG_CONFIG_HOME', '/custom/xdg');
+    expect(getAnthropicCredentialsFilePath()).toBe(resolve('/custom/xdg', 'anthropic', 'credentials', 'default.json'));
+  });
+
+  it('prefers ANTHROPIC_CONFIG_DIR over XDG_CONFIG_HOME', () => {
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', '/custom/anthropic');
+    vi.stubEnv('XDG_CONFIG_HOME', '/custom/xdg');
+    expect(getAnthropicCredentialsFilePath()).toBe(resolve('/custom/anthropic', 'credentials', 'default.json'));
+  });
+
+  it('treats an empty ANTHROPIC_CONFIG_DIR as unset', () => {
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', '');
+    vi.stubEnv('XDG_CONFIG_HOME', '/custom/xdg');
+    expect(getAnthropicCredentialsFilePath()).toBe(resolve('/custom/xdg', 'anthropic', 'credentials', 'default.json'));
+  });
+});
+
 describe('parseCodexAuthJson', () => {
   it('parses Codex ChatGPT auth.json credentials', () => {
     const accessToken = unsignedJwt({ exp: 4_102_444_800, sub: 'codex-test' });
@@ -296,6 +385,16 @@ describe('loadCredentialsFromFile', () => {
     const result = loadCredentialsFromFile(filePath);
     expect(result).toBeNull();
   });
+
+  it('loads Anthropic CLI-format credentials', () => {
+    const filePath = resolve(tmpDir, 'default.json');
+    writeFileSync(filePath, JSON.stringify(VALID_ANTHROPIC_CLI_CREDENTIALS));
+
+    const result = loadCredentialsFromFile(filePath);
+    expect(result).not.toBeNull();
+    expect(result!.accessToken).toBe('sk-ant-oat01-cli-access-token');
+    expect(result!.expiresAt).toBe(VALID_ANTHROPIC_CLI_CREDENTIALS.expires_at * 1000);
+  });
 });
 
 describe('loadCodexOAuthCredentials', () => {
@@ -382,6 +481,86 @@ describe('detectAuthMethod', () => {
       expect(result.credentials.accessToken).toBe('sk-ant-oat01-test-access-token');
       expect(result.source).toBe('file');
     }
+  });
+
+  it('reports the source file path when loadFromFilesWithSource is available', async () => {
+    const creds = validCreds();
+    const filePath = '/home/user/.config/anthropic/credentials/default.json';
+    const sources = makeSources({
+      loadFromFilesWithSource: () => [{ credentials: creds, filePath }],
+    });
+
+    const result = await detectAuthMethod(makeConfig(), sources);
+    expect(result.kind).toBe('oauth');
+    if (result.kind === 'oauth' && result.source === 'file') {
+      expect(result.filePath).toBe(filePath);
+    }
+  });
+
+  it('saves refreshed credentials back to the originating file', async () => {
+    const filePath = '/home/user/.config/anthropic/credentials/default.json';
+    const refreshed = validCreds({ accessToken: 'sk-ant-oat01-refreshed' });
+    const saveToFile = vi.fn();
+    const sources = makeSources({
+      loadFromFilesWithSource: () => [{ credentials: expiredCreds(), filePath }],
+      refreshToken: async () => refreshed,
+      saveToFile,
+    });
+
+    const result = await detectAuthMethod(makeConfig(), sources);
+    expect(result.kind).toBe('oauth');
+    if (result.kind === 'oauth' && result.source === 'file') {
+      expect(result.credentials.accessToken).toBe('sk-ant-oat01-refreshed');
+      expect(result.filePath).toBe(filePath);
+    }
+    expect(saveToFile).toHaveBeenCalledWith(refreshed, filePath);
+  });
+
+  it('does not let an expired legacy file shadow a valid Anthropic CLI file', async () => {
+    const legacyPath = '/home/user/.claude/.credentials.json';
+    const cliPath = '/home/user/.config/anthropic/credentials/default.json';
+    const cliCreds = validCreds({ accessToken: 'sk-ant-oat01-cli-valid' });
+    const sources = makeSources({
+      loadFromFilesWithSource: () => [
+        { credentials: expiredCreds(), filePath: legacyPath },
+        { credentials: cliCreds, filePath: cliPath },
+      ],
+      // Legacy refresh token is stale/revoked
+      refreshToken: async () => null,
+    });
+
+    const result = await detectAuthMethod(makeConfig(), sources);
+    expect(result.kind).toBe('oauth');
+    if (result.kind === 'oauth' && result.source === 'file') {
+      expect(result.credentials.accessToken).toBe('sk-ant-oat01-cli-valid');
+      expect(result.filePath).toBe(cliPath);
+    }
+  });
+
+  it('falls through to the next file when the first is expired and unrefreshable', async () => {
+    const legacyPath = '/home/user/.claude/.credentials.json';
+    const cliPath = '/home/user/.config/anthropic/credentials/default.json';
+    const expiredLegacy = expiredCreds({ refreshToken: 'sk-ant-ort01-legacy-stale' });
+    const expiredCli = expiredCreds({ refreshToken: 'sk-ant-ort01-cli-good' });
+    const refreshed = validCreds({ accessToken: 'sk-ant-oat01-cli-refreshed' });
+    const saveToFile = vi.fn();
+    const sources = makeSources({
+      loadFromFilesWithSource: () => [
+        { credentials: expiredLegacy, filePath: legacyPath },
+        { credentials: expiredCli, filePath: cliPath },
+      ],
+      // Only the CLI store's refresh token still works
+      refreshToken: async (rt) => (rt === 'sk-ant-ort01-cli-good' ? refreshed : null),
+      saveToFile,
+    });
+
+    const result = await detectAuthMethod(makeConfig(), sources);
+    expect(result.kind).toBe('oauth');
+    if (result.kind === 'oauth' && result.source === 'file') {
+      expect(result.credentials.accessToken).toBe('sk-ant-oat01-cli-refreshed');
+      expect(result.filePath).toBe(cliPath);
+    }
+    expect(saveToFile).toHaveBeenCalledWith(refreshed, cliPath);
   });
 
   it('falls back to apikey when no OAuth credentials', async () => {
@@ -499,7 +678,7 @@ describe('detectAuthMethod', () => {
       expect(result.credentials.accessToken).toBe('sk-ant-oat01-refreshed');
       expect(result.source).toBe('file');
     }
-    expect(saveFn).toHaveBeenCalledWith(refreshed);
+    expect(saveFn).toHaveBeenCalledWith(refreshed, undefined);
   });
 
   it('refreshes expired Keychain credentials and returns keychainServiceName', async () => {
@@ -956,6 +1135,63 @@ describe('saveOAuthCredentials', () => {
 
     const saved = JSON.parse(readFileSync(filePath, 'utf-8'));
     expect(saved.claudeAiOauth.accessToken).toBe(creds.accessToken);
+  });
+
+  it('preserves the Anthropic CLI format when writing to an Anthropic CLI file', () => {
+    const filePath = resolve(tmpDir, 'default.json');
+    writeFileSync(filePath, JSON.stringify(VALID_ANTHROPIC_CLI_CREDENTIALS));
+
+    const expiresAt = Date.now() + 7_200_000;
+    const creds = validCreds({ accessToken: 'new-at', refreshToken: 'new-rt', expiresAt });
+    saveOAuthCredentials(creds, filePath);
+
+    const saved = JSON.parse(readFileSync(filePath, 'utf-8'));
+    // Updated fields, snake_case, expires_at back in epoch seconds
+    expect(saved.access_token).toBe('new-at');
+    expect(saved.refresh_token).toBe('new-rt');
+    expect(saved.expires_at).toBe(Math.round(expiresAt / 1000));
+    // Preserved fields
+    expect(saved.type).toBe('oauth_token');
+    expect(saved.version).toBe('1.0');
+    expect(saved.scope).toBe(VALID_ANTHROPIC_CLI_CREDENTIALS.scope);
+    expect(saved.organization_uuid).toBe(VALID_ANTHROPIC_CLI_CREDENTIALS.organization_uuid);
+    // No claudeAiOauth wrapper introduced
+    expect(saved.claudeAiOauth).toBeUndefined();
+  });
+
+  it('preserves the Anthropic CLI format for a file without a type field', () => {
+    const filePath = resolve(tmpDir, 'default.json');
+    const noType = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, type: undefined };
+    writeFileSync(filePath, JSON.stringify(noType));
+
+    const creds = validCreds({ accessToken: 'new-at' });
+    saveOAuthCredentials(creds, filePath);
+
+    const saved = JSON.parse(readFileSync(filePath, 'utf-8'));
+    expect(saved.access_token).toBe('new-at');
+    expect(saved.claudeAiOauth).toBeUndefined();
+  });
+
+  it('writes the Anthropic CLI format when the CLI store file vanished before save', () => {
+    // The origin file can be deleted or rotated by the Anthropic CLI between
+    // detection and refresh write-back; the path must decide the format.
+    vi.stubEnv('ANTHROPIC_CONFIG_DIR', resolve(tmpDir, 'anthropic'));
+    try {
+      const cliPath = resolve(tmpDir, 'anthropic', 'credentials', 'default.json');
+      mkdirSync(resolve(tmpDir, 'anthropic', 'credentials'), { recursive: true });
+
+      const expiresAt = Date.now() + 3_600_000;
+      const creds = validCreds({ accessToken: 'new-at', refreshToken: 'new-rt', expiresAt });
+      saveOAuthCredentials(creds, cliPath);
+
+      const saved = JSON.parse(readFileSync(cliPath, 'utf-8'));
+      expect(saved.access_token).toBe('new-at');
+      expect(saved.refresh_token).toBe('new-rt');
+      expect(saved.expires_at).toBe(Math.round(expiresAt / 1000));
+      expect(saved.claudeAiOauth).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
