@@ -20,8 +20,7 @@ type ExecCall = {
 };
 
 type MockResponse =
-  | { stdout: string; stderr?: string }
-  | { error: true; code: number; stdout?: string; stderr?: string };
+  { stdout: string; stderr?: string } | { error: true; code: number; stdout?: string; stderr?: string };
 
 interface MockState {
   responseStdout: string;

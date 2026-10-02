@@ -164,10 +164,7 @@ export interface WorkflowSettings {
  * State definition. Discriminated on `type`.
  */
 export type WorkflowStateDefinition =
-  | AgentStateDefinition
-  | HumanGateStateDefinition
-  | DeterministicStateDefinition
-  | TerminalStateDefinition;
+  AgentStateDefinition | HumanGateStateDefinition | DeterministicStateDefinition | TerminalStateDefinition;
 
 export interface FanOutDefinition {
   /**
