@@ -6,7 +6,7 @@ const dockerfile = readFileSync(resolve('docker/nested-daemon/Dockerfile'), 'utf
 
 describe('purpose-built rootless nested daemon image', () => {
   it('accepts the common resolved stock source and resets inherited OCI metadata through scratch', () => {
-    expect(dockerfile).toContain('ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.2.1-dind-rootless');
+    expect(dockerfile).toContain('ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.9.2-dind-rootless');
     expect(dockerfile).toContain('FROM ${IRONCURTAIN_DOCKER_SOURCE} AS stock');
     expect(dockerfile).toMatch(/\nFROM scratch\n/u);
     expect(dockerfile).toContain('COPY --from=stock / /');
@@ -19,9 +19,9 @@ describe('purpose-built rootless nested daemon image', () => {
     expect(dockerfile).toContain('ENTRYPOINT ["/usr/local/lib/ironcurtain/daemon-entrypoint.sh"]');
     expect(dockerfile).toContain('DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none');
     expect(dockerfile).toContain('XDG_RUNTIME_DIR=/run/ironcurtain-docker');
-    expect(dockerfile).toContain('DOCKER_VERSION=29.2.1');
-    expect(dockerfile).toContain('DOCKER_BUILDX_VERSION=0.31.1');
-    expect(dockerfile).toContain('DOCKER_COMPOSE_VERSION=5.1.0');
+    expect(dockerfile).toContain('DOCKER_VERSION=29.9.2');
+    expect(dockerfile).toContain('DOCKER_BUILDX_VERSION=0.38.1');
+    expect(dockerfile).toContain('DOCKER_COMPOSE_VERSION=5.6.1');
     expect(dockerfile).not.toMatch(/tcp:\/\//u);
   });
 

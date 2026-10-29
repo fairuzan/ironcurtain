@@ -22,14 +22,14 @@ describe('Docker client toolchain manifest', () => {
     const loaded = loadClientToolchainManifest(resolve('config/docker-workload/client-toolchain.json'), architecture);
     expect(loaded.manifest).toMatchObject({
       architecture,
-      generation: 'docker-rootless-29.2.1-v2',
-      buildxVersion: '0.31.1',
-      composeVersion: '5.1.0',
+      generation: 'docker-rootless-29.9.2-v2',
+      buildxVersion: '0.38.1',
+      composeVersion: '5.6.1',
     });
     expect(loaded.manifest).not.toHaveProperty('realRunc');
     expect(loaded.manifest).not.toHaveProperty('source');
     expect(loaded).not.toHaveProperty('sha256');
-    expect(getDockerToolchainSourceReference(loaded.manifest)).toBe('docker:29.2.1-dind-rootless');
+    expect(getDockerToolchainSourceReference(loaded.manifest)).toBe('docker:29.9.2-dind-rootless');
   });
 
   it('rejects symlink, writable, malformed, and internally incompatible manifests', () => {
@@ -60,7 +60,7 @@ describe('Docker client toolchain preflight', () => {
       const fixture = manifestFixture();
       const loaded = loadClientToolchainManifest(fixture.path, architecture);
       const runtime = runtimeFixture({ architecture });
-      const tuple = { dockerCli: '29.2.1', dockerDaemon: '29.2.1', buildx: '0.31.1', compose: '5.1.0' };
+      const tuple = { dockerCli: '29.9.2', dockerDaemon: '29.9.2', buildx: '0.38.1', compose: '5.6.1' };
       const result = await preflightClientToolchain({
         runtime,
         containerId: 'agent-id',
@@ -68,7 +68,7 @@ describe('Docker client toolchain preflight', () => {
       });
       expect(result).toMatchObject({
         architecture,
-        dockerApi: { actual: '1.53' },
+        dockerApi: { actual: '1.56' },
         toolchain: tuple,
       });
       expect(runtime.exec).toHaveBeenNthCalledWith(
@@ -109,19 +109,19 @@ describe('Docker client toolchain preflight', () => {
 
     await expect(
       preflightClientToolchain({
-        runtime: runtimeFixture({ docker: JSON.stringify(dockerVersion({ Version: '29.2.2' })) }),
+        runtime: runtimeFixture({ docker: JSON.stringify(dockerVersion({ Version: '29.9.3' })) }),
         containerId: 'agent-id',
         manifest: loaded,
       }),
-    ).rejects.toThrow(/daemon version expected 29\.2\.1, got 29\.2\.2/u);
+    ).rejects.toThrow(/daemon version expected 29\.9\.2, got 29\.9\.3/u);
 
     await expect(
       preflightClientToolchain({
-        runtime: runtimeFixture({ buildx: 'github.com/docker/buildx v0.32.0 deadbeef' }),
+        runtime: runtimeFixture({ buildx: 'github.com/docker/buildx v0.39.0 deadbeef' }),
         containerId: 'agent-id',
         manifest: loaded,
       }),
-    ).rejects.toThrow(/Buildx version expected 0\.31\.1, got 0\.32\.0/u);
+    ).rejects.toThrow(/Buildx version expected 0\.38\.1, got 0\.39\.0/u);
   });
 
   it('rejects failed commands and unparseable plugin output', async () => {
@@ -154,18 +154,18 @@ function manifestFixture(): {
   const path = join(directory, 'manifest.json');
   const manifest = {
     schemaVersion: 2,
-    generation: 'docker-rootless-29.2.1-v2',
+    generation: 'docker-rootless-29.9.2-v2',
     platform: 'linux',
     docker: {
-      cliVersion: '29.2.1',
-      daemonVersion: '29.2.1',
-      clientApiVersion: '1.53',
-      daemonApiVersion: '1.53',
+      cliVersion: '29.9.2',
+      daemonVersion: '29.9.2',
+      clientApiVersion: '1.56',
+      daemonApiVersion: '1.56',
       minimumDaemonApiVersion: '1.44',
-      compatibleApiRange: { min: '1.44', max: '1.53' },
+      compatibleApiRange: { min: '1.44', max: '1.56' },
     },
-    buildxVersion: '0.31.1',
-    composeVersion: '5.1.0',
+    buildxVersion: '0.38.1',
+    composeVersion: '5.6.1',
   } as const satisfies ClientToolchainCompatibility;
   writeFileSync(path, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
   return { directory, path, manifest };
@@ -195,11 +195,11 @@ function runtimeFixture(
       if (calls === 2) {
         return {
           exitCode: 0,
-          stdout: options.buildx ?? 'github.com/docker/buildx v0.31.1 a2675950',
+          stdout: options.buildx ?? 'github.com/docker/buildx v0.38.1 0dbe87f3',
           stderr: '',
         };
       }
-      return { exitCode: 0, stdout: options.compose ?? '5.1.0', stderr: '' };
+      return { exitCode: 0, stdout: options.compose ?? '5.6.1', stderr: '' };
     }),
   };
 }
@@ -209,10 +209,10 @@ function dockerVersion(
   architecture: DockerToolchainArchitecture = 'arm64',
 ) {
   return {
-    Client: { Version: '29.2.1', ApiVersion: '1.53', Os: 'linux', Arch: architecture },
+    Client: { Version: '29.9.2', ApiVersion: '1.56', Os: 'linux', Arch: architecture },
     Server: {
-      Version: '29.2.1',
-      ApiVersion: '1.53',
+      Version: '29.9.2',
+      ApiVersion: '1.56',
       MinAPIVersion: '1.44',
       Os: 'linux',
       Arch: architecture,

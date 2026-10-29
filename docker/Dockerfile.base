@@ -1,4 +1,4 @@
-ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.2.1-dind-rootless
+ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.9.2-dind-rootless
 FROM ${IRONCURTAIN_DOCKER_SOURCE} AS docker-toolchain
 USER root
 COPY install-docker-toolchain.sh /tmp/install-docker-toolchain.sh

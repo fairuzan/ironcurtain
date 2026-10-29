@@ -3,7 +3,7 @@ import { resolveDockerToolchainSource } from '../../src/docker-workload/toolchai
 
 const image = {
   id: `sha256:${'a'.repeat(64)}`,
-  repoTags: ['docker:29.2.1-dind-rootless'],
+  repoTags: ['docker:29.9.2-dind-rootless'],
   repoDigests: [`docker@sha256:${'b'.repeat(64)}`],
   architecture: 'amd64' as const,
   labels: {},
@@ -28,7 +28,7 @@ describe('shared Docker source selection', () => {
       pullImage: vi.fn(),
     };
     await resolveDockerToolchainSource(runtime, 'amd64');
-    expect(runtime.pullImage).toHaveBeenCalledWith('docker:29.2.1-dind-rootless');
+    expect(runtime.pullImage).toHaveBeenCalledWith('docker:29.9.2-dind-rootless');
   });
 
   it('rejects a source for the wrong execution architecture', async () => {
@@ -66,6 +66,6 @@ describe('shared Docker source selection', () => {
         },
         'arm64',
       ),
-    ).resolves.toMatchObject({ reference: `docker:29.2.1-dind-rootless@${image.id}` });
+    ).resolves.toMatchObject({ reference: `docker:29.9.2-dind-rootless@${image.id}` });
   });
 });

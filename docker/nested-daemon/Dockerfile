@@ -1,4 +1,4 @@
-ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.2.1-dind-rootless
+ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.9.2-dind-rootless
 
 # The tiny runtime wrapper adds runc's --no-new-keyring option for ordinary
 # runs and integrated BuildKit RUN
@@ -37,9 +37,9 @@ LABEL com.ironcurtain.docker-workload.image-role="nested-daemon"
 
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/home/rootless \
-    DOCKER_VERSION=29.2.1 \
-    DOCKER_BUILDX_VERSION=0.31.1 \
-    DOCKER_COMPOSE_VERSION=5.1.0 \
+    DOCKER_VERSION=29.9.2 \
+    DOCKER_BUILDX_VERSION=0.38.1 \
+    DOCKER_COMPOSE_VERSION=5.6.1 \
     DOCKER_TLS_CERTDIR="" \
     DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none \
     XDG_RUNTIME_DIR=/run/ironcurtain-docker/docker

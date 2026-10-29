@@ -502,7 +502,7 @@ describe('Docker Desktop sidecar lifecycle', () => {
         readonly: true,
         noCopy: true,
       },
-      readiness: { driver: 'vfs', serverVersion: '29.2.1' },
+      readiness: { driver: 'vfs', serverVersion: '29.9.2' },
       network: { name: 'ironcurtain' },
     });
     expect(fixture.bootstrapObservations).toEqual([

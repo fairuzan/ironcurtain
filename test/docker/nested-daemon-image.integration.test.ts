@@ -50,9 +50,9 @@ describe.skipIf(!ready)('purpose-built nested daemon image metadata', () => {
       expect(parsed[0].Config?.ExposedPorts).toBeUndefined();
       expect(parsed[0].Config?.Env).toEqual(
         expect.arrayContaining([
-          'DOCKER_VERSION=29.2.1',
-          'DOCKER_BUILDX_VERSION=0.31.1',
-          'DOCKER_COMPOSE_VERSION=5.1.0',
+          'DOCKER_VERSION=29.9.2',
+          'DOCKER_BUILDX_VERSION=0.38.1',
+          'DOCKER_COMPOSE_VERSION=5.6.1',
           'DOCKERD_ROOTLESS_ROOTLESSKIT_NET=none',
         ]),
       );
