@@ -21,14 +21,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/ruff /usr/local/bin/ruff && \
     rm -rf /root/.local
 
-# Pre-install Python 3.12 so uv never needs to download it at runtime.
+# Pre-install Python 3.14 so uv never needs to download it at runtime.
 # Containers run with --network=none, so runtime downloads would fail.
 # Install to a shared location so the codespace user can find it.
 # uv uses rustls by default. Runtime sessions supply a CA-neutral image with
-# a read-only per-session trust bundle and UV_NATIVE_TLS/SSL_CERT_FILE wiring.
-ENV UV_NATIVE_TLS=1
+# a read-only per-session trust bundle and UV_SYSTEM_CERTS/SSL_CERT_FILE wiring.
+ENV UV_SYSTEM_CERTS=1
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
-RUN uv python install 3.12
+RUN uv python install 3.14
 # Install pip so agents can use `pip install` directly.
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*
 

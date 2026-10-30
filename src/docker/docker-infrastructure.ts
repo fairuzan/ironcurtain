@@ -4082,8 +4082,8 @@ async function provisionWorkflowPythonDependencies(infra: DockerInfrastructure):
     'set -eu',
     `if [ -f ${quote([sentinel])} ]; then exit 0; fi`,
     `find ${quote([mount.target])} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`,
-    `UV_NATIVE_TLS=1 uv venv ${quote([mount.target])}`,
-    `VIRTUAL_ENV=${quote([mount.target])} UV_NATIVE_TLS=1 uv pip install -r ${quote([`${CONTAINER_SCRIPTS_DIR}/requirements.txt`])}`,
+    `UV_SYSTEM_CERTS=1 uv venv ${quote([mount.target])}`,
+    `VIRTUAL_ENV=${quote([mount.target])} UV_SYSTEM_CERTS=1 uv pip install -r ${quote([`${CONTAINER_SCRIPTS_DIR}/requirements.txt`])}`,
     `touch ${quote([sentinel])}`,
   ].join('\n');
 

@@ -99,7 +99,7 @@ named volumes, or tmpfs anywhere, so a commit excludes all of them cleanly.
 | Workflow Python venv | `~/.ironcurtain/workflow-deps/<hash>/python-venv` → `/opt/workflow-venv` (RW) | ✅ content-hash cache |
 | Workflow Node modules | `~/.ironcurtain/workflow-deps/<hash>/node_modules` → `/opt/workflow-node_modules` (RW) | ✅ content-hash cache |
 | Agent conversation history | conversation-state dir (e.g. `~/.claude`) bind-mounted RW | ✅ host mount |
-| Python 3.12, Node, Playwright/Chromium, uv, ruff, socat, CA cert | `ironcurtain-base:latest` (`docker/Dockerfile.base`) | ✅ image layer |
+| Python 3.14, Node, Playwright/Chromium, uv, ruff, socat, CA cert | `ironcurtain-base:latest` (`docker/Dockerfile.base`) | ✅ image layer |
 | Agent CLI (e.g. Claude Code) | agent image layer (`docker/Dockerfile.claude-code`) | ✅ image layer |
 
 The dependency cache (`provisionWorkflowDependencies`,

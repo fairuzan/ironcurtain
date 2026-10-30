@@ -81,11 +81,11 @@ states:
       3a. INSTALL THE DURABLE VENV DEPS (through the proxy). Skip this sub-step
          entirely if step 1 already verified the marker. Otherwise, for each
          needed package, install it into /opt/workflow-venv using uv:
-           UV_NATIVE_TLS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install <pkg> [<pkg> ...]
+           UV_SYSTEM_CERTS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install <pkg> [<pkg> ...]
          Network egress is mediated by the IronCurtain MITM proxy
          (HTTPS_PROXY/HTTP_PROXY are already set); registries are reachable.
          Prefer a requirements.txt install when the workspace ships one:
-           UV_NATIVE_TLS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install -r /workspace/requirements.txt
+           UV_SYSTEM_CERTS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install -r /workspace/requirements.txt
 
       3b. RE-APPLY SYSTEM LIBRARIES (every entry, NOT gated by the marker). If -
          and only if - a wheel genuinely needs an unbundled system library, run

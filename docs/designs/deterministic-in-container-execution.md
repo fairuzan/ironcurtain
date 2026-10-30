@@ -98,7 +98,7 @@ The orchestrator-provided actor wraps `executeDeterministicState` at `src/workfl
 
 - Workspace is bind-mounted RW at `/workspace` (`CONTAINER_WORKSPACE_DIR = '/workspace'`, `src/docker/agent-adapter.ts:19`; mount `src/docker/docker-infrastructure.ts:950`).
 - `--network none` on Linux, `--init`/tini PID 1 (`src/docker/docker-manager.ts:70-78,1086`).
-- Base image `mcr.microsoft.com/devcontainers/universal:latest` (`docker/Dockerfile.base:1`) ships Python 3.12 + `uv` + `ruff` + pip + Node. `uv` is configured for offline runtime with `UV_NATIVE_TLS=1` and a pre-warmed `UV_PYTHON_INSTALL_DIR=/opt/uv-python` (`docker/Dockerfile.base`).
+- Base image `mcr.microsoft.com/devcontainers/universal:latest` (`docker/Dockerfile.base:1`) ships Python 3.14 + `uv` + `ruff` + pip + Node. `uv` is configured for offline runtime with `UV_SYSTEM_CERTS=1` and a pre-warmed `UV_PYTHON_INSTALL_DIR=/opt/uv-python` (`docker/Dockerfile.base`).
 
 **Skill staging (the analogous prior art).** The workflow package's `skills/` tree is staged to `resolve(bundleDir, BUNDLE_SKILLS_SUBDIR)` and bind-mounted **read-only** into the Claude adapter's `/home/codespace/.claude/skills` (`src/docker/docker-infrastructure.ts:644-658`, mount RO at `:1066`). It is **re-staged each transition** by a cached stager (`createCachedStager`) because per-state `skills:` filtering (`resolveSkillsForSession`, `src/skills/discovery.ts:232`) changes the staged set between states.
 
@@ -385,7 +385,7 @@ Runtime is `--network=none`. All fetching happens at **image build**, which has 
 
 ### 6.1 No-deps fast path (default)
 
-If `scripts/` has **no** `requirements.txt` and **no** `package.json` (or no `scripts/` at all), use the **shared agent image** unchanged. The base image already ships Python 3.12 stdlib, `ruff`, pip, and Node. Zero rebuild, zero per-workflow image. This is the common case and the only case vuln-discovery / design-and-code hit (they ship no scripts).
+If `scripts/` has **no** `requirements.txt` and **no** `package.json` (or no `scripts/` at all), use the **shared agent image** unchanged. The base image already ships Python 3.14 stdlib, `ruff`, pip, and Node. Zero rebuild, zero per-workflow image. This is the common case and the only case vuln-discovery / design-and-code hit (they ship no scripts).
 
 ### 6.2 Per-workflow image (when a manifest exists)
 
@@ -427,7 +427,7 @@ USER codespace
 - **Python:** `requirements.txt` → `uv pip install` into a baked venv at `/opt/workflow-venv`; the venv `bin` is prepended to `PATH` so `python` resolves the **venv interpreter** with deps. Deterministic states that need the deps should invoke the venv interpreter explicitly — e.g. `['/opt/workflow-venv/bin/python', '/workflow-scripts/run_eval.py']` — or rely on the `PATH` ordering (`python` → `/opt/workflow-venv/bin/python`). (Decision: `uv pip install` over bare `pip` — uv is already the base-image standard.)
 - **Node:** `package.json` (+ `package-lock.json` if present) → `npm ci --omit=dev` (or `npm install --omit=dev` without a lockfile); baked `node_modules` at `/opt/workflow-node_modules`, exposed via `NODE_PATH` so `require()` resolves it even though scripts run from `/workflow-scripts`. (Decision: prefer `npm ci` for lockfile-pinned reproducibility; npm over pnpm because npm ships in the base image and avoids a new toolchain.)
 
-> **Build-time network model (corrected).** There is **no MITM/proxy at `docker build` time.** `buildImage` injects only `DOCKER_BUILDKIT=1` and no proxy env (`src/docker/docker-manager.ts:342-347`); the `HTTPS_PROXY`/`HTTP_PROXY` MITM is only injected into the _running container_ at `docker create` time (`src/docker/docker-infrastructure.ts:969-970,1025-1026`), not the build. So the build reaches PyPI/npm over the **normal build-host network** — implementers should not hunt for a build-time proxy or a CA-trust shim. (`UV_NATIVE_TLS=1` in the base image is incidental here; it governs uv's TLS backend, not any MITM trust, and no MITM is in the build path.)
+> **Build-time network model (corrected).** There is **no MITM/proxy at `docker build` time.** `buildImage` injects only `DOCKER_BUILDKIT=1` and no proxy env (`src/docker/docker-manager.ts:342-347`); the `HTTPS_PROXY`/`HTTP_PROXY` MITM is only injected into the _running container_ at `docker create` time (`src/docker/docker-infrastructure.ts:969-970,1025-1026`), not the build. So the build reaches PyPI/npm over the **normal build-host network** — implementers should not hunt for a build-time proxy or a CA-trust shim. (`UV_SYSTEM_CERTS=1` in the base image is incidental here; it governs uv's TLS backend, not any MITM trust, and no MITM is in the build path.)
 
 **Where deps live: baked in the image, NOT mounted.** The `/workflow-scripts` _code_ mount is RO and per-run; the _dependencies_ are baked into the image. This keeps the RO code mount free of a giant `node_modules`/venv, makes the image self-contained for offline runtime, and gives reproducibility (the build hash pins the manifest — §6.3).
 

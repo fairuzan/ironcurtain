@@ -386,7 +386,7 @@ describe.skipIf(!dockerReady)('evolve generic experiment harness with real Docke
                   '-lc',
                   [
                     'set -eu',
-                    'UV_NATIVE_TLS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install -r /workspace/requirements.txt',
+                    'UV_SYSTEM_CERTS=1 VIRTUAL_ENV=/opt/workflow-venv uv pip install -r /workspace/requirements.txt',
                     "printf 'tabulate\\n' > /workspace/.evolve_runs/main/.provisioned",
                   ].join('\n'),
                 ],
